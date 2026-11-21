@@ -5,9 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/adrianliechti/go-monty/internal/pb"
@@ -16,10 +19,13 @@ import (
 // Limits bounds a session. Zero values mean unlimited, except
 // MaxRecursionDepth and MaxSuspensions, which default to 1000.
 type Limits struct {
-	// MaxDuration caps the time the interpreter spends executing bytecode.
-	// Time spent in host functions does not count. Exceeding it raises
-	// TimeoutError in the sandbox.
+	// MaxDuration caps the time the interpreter spends executing one run
+	// (a Start or Run, across its host calls). Time spent in host functions
+	// does not count. Exceeding it raises TimeoutError in the sandbox.
 	MaxDuration time.Duration
+	// MaxTurnDuration caps the time the interpreter runs between two host
+	// calls of a run.
+	MaxTurnDuration time.Duration
 	// MaxMemory caps the sandbox heap in bytes. Exceeding it raises
 	// MemoryError; a burst past the ceiling above it kills the worker.
 	MaxMemory uint64
@@ -27,10 +33,15 @@ type Limits struct {
 	GCInterval uint64
 	// MaxRecursionDepth caps Python call depth (RecursionError).
 	MaxRecursionDepth uint64
-	// MaxSuspensions caps host calls (functions, name lookups, OS calls) over
-	// the life of the session, as upstream does. Exceeding it aborts the
-	// current run with a RuntimeError; Reset starts the count over.
+	// MaxSuspensions caps the times the sandbox pauses for the host
+	// (functions, name lookups, OS calls, waits on deferred calls) over the
+	// life of the session, as upstream does. Exceeding it aborts the current
+	// run with a RuntimeError; Reset starts the count over.
 	MaxSuspensions uint64
+	// MaxSleep caps the total time the session's time.sleep() and
+	// asyncio.sleep() calls wait under SleepSystem. Exceeding it aborts the
+	// current run with a TimeoutError.
+	MaxSleep time.Duration
 }
 
 func (l *Limits) proto() *pb.ResourceLimits {
@@ -40,7 +51,15 @@ func (l *Limits) proto() *pb.ResourceLimits {
 	out := &pb.ResourceLimits{}
 	if l.MaxDuration > 0 {
 		v := uint64(l.MaxDuration / time.Microsecond)
-		out.MaxDurationMicros = &v
+		out.MaxFeedDurationMicros = &v
+	}
+	if l.MaxTurnDuration > 0 {
+		v := uint64(l.MaxTurnDuration / time.Microsecond)
+		out.MaxTurnDurationMicros = &v
+	}
+	if l.MaxSleep > 0 {
+		v := uint64(l.MaxSleep / time.Microsecond)
+		out.MaxTotalSleepMicros = &v
 	}
 	if l.MaxMemory > 0 {
 		v := l.MaxMemory
@@ -118,6 +137,12 @@ type SessionOptions struct {
 	// keeps the default (on, 120-byte operand reprs), 0 disables them, any
 	// other value sets the per-operand byte budget.
 	AssertMessageAnnotations *uint32
+	// OSPolicy selects the session's clock, timezone, sleeps and randomness.
+	OSPolicy OSPolicy
+	// PrintFlushInterval batches print() output: the sandbox holds it for up
+	// to this long before delivering it. Zero delivers every completed line
+	// as it is printed.
+	PrintFlushInterval time.Duration
 }
 
 func (o *SessionOptions) proto() *pb.Configure {
@@ -134,7 +159,10 @@ func (o *SessionOptions) proto() *pb.Configure {
 		TypeCheckFormat:          o.TypeCheckFormat.proto(),
 		TypeCheckColor:           o.TypeCheckColor,
 		ProtocolVersion:          protocolVersion,
+		OsPolicy:                 o.OSPolicy.proto(),
 	}
+	flush := uint32(o.PrintFlushInterval / time.Millisecond)
+	cfg.PrintFlushIntervalMs = &flush
 	if o.TypeCheckStubs != "" {
 		stubs := o.TypeCheckStubs
 		cfg.TypeCheckStubs = &stubs
@@ -176,13 +204,15 @@ type RunOptions struct {
 	// Inputs are bound as global variables before the code runs.
 	Inputs map[string]any
 	// Functions are callable from the code by name and run synchronously,
-	// each call pausing the sandbox until it returns. Their names stay bound
-	// in the session's globals for later runs.
+	// each call pausing the sandbox until it returns. Their names are bound
+	// as globals, shadowing a Python builtin of the same name, and stay
+	// bound for later runs.
 	Functions map[string]Function
 	// AsyncFunctions are callable like Functions but run in their own
 	// goroutines while the sandbox continues. Code that needs the result
 	// (awaiting it, or using it) waits for it; asyncio.gather over several
-	// calls runs them concurrently.
+	// calls runs them concurrently. A call the code never awaits outlives
+	// the run: Session.Wait joins it.
 	AsyncFunctions map[string]Function
 	// Values are resolved lazily: an entry is converted only when the code
 	// reads its name, unlike Inputs, which are bound before the code runs.
@@ -200,7 +230,20 @@ type RunOptions struct {
 }
 
 func (o *RunOptions) start() StartOptions {
-	return StartOptions{Inputs: o.Inputs, Stdout: o.Stdout, Stderr: o.Stderr, SkipTypeCheck: o.SkipTypeCheck}
+	inputs := o.Inputs
+	if len(o.Functions)+len(o.AsyncFunctions) > 0 {
+		// Bound up front rather than looked up on first use, so a function
+		// named like a builtin (open, exec, input) is the one the code calls.
+		inputs = make(map[string]any, len(o.Functions)+len(o.AsyncFunctions)+len(o.Inputs))
+		for name := range o.Functions {
+			inputs[name] = FunctionRef{Name: name}
+		}
+		for name := range o.AsyncFunctions {
+			inputs[name] = FunctionRef{Name: name}
+		}
+		maps.Copy(inputs, o.Inputs)
+	}
+	return StartOptions{Inputs: inputs, Stdout: o.Stdout, Stderr: o.Stderr, SkipTypeCheck: o.SkipTypeCheck}
 }
 
 // Session is a Python REPL: globals persist across runs. It is safe for
@@ -214,13 +257,25 @@ type Session struct {
 	store          *objectStore
 	maxSuspensions uint64
 	suspensions    uint64
-	executionTime  time.Duration
-	pending        *Suspension
-	stdout         io.Writer
-	stderr         io.Writer
-	closed         bool
+	// sleepLimit is Limits.MaxSleep (zero: unlimited), sleepMax the cap on
+	// one system sleep.
+	sleepLimit    time.Duration
+	sleepUsed     time.Duration
+	sleepMax      time.Duration
+	executionTime time.Duration
+	pending       *Suspension
+	// driver is the Run in progress, which waits out async sleeps without
+	// blocking the sandbox's other tasks.
+	driver *driver
+	stdout io.Writer
+	stderr io.Writer
+	closed bool
 	// release returns the worker to a Pool instead of closing it.
 	release func(ctx context.Context, w *worker)
+	// calls and running track AsyncFunctions calls, which can outlive the
+	// run that started them.
+	calls   sync.WaitGroup
+	running atomic.Int64
 }
 
 const defaultMaxSuspensions = 1000
@@ -243,23 +298,33 @@ func (r *Runtime) NewSession(ctx context.Context, opts SessionOptions) (*Session
 // (with its methods, or with Continue). Host objects do not travel with a
 // dump; a restored session reports calls on them as Suspensions with
 // ObjectID set but no Object.
-func (r *Runtime) Restore(ctx context.Context, state []byte) (*Session, error) {
+//
+// The dump carries the session's script name and limits. Its OSPolicy and
+// print settings do not travel: pass the SessionOptions to restore them,
+// whose Limits can only tighten the dump's.
+func (r *Runtime) Restore(ctx context.Context, state []byte, opts ...SessionOptions) (*Session, error) {
 	s, err := r.newSession(ctx)
 	if err != nil {
 		return nil, err
 	}
-	s.stdout, s.stderr = os.Stdout, os.Stderr
-	events, err := s.send(ctx, &pb.ParentRequest{Kind: &pb.ParentRequest_Load{Load: &pb.Load{State: state}}})
+	var o SessionOptions
+	if len(opts) > 0 {
+		o = opts[0]
+	}
+	s.budget(o)
+	cfg := o.proto()
+	cfg.First = &pb.Configure_Load{Load: &pb.Load{State: state}}
+	events, err := s.send(ctx, &pb.ClientRequest{Kind: &pb.ClientRequest_Configure{Configure: cfg}})
 	if err != nil {
 		_ = s.Close(ctx)
 		return nil, err
 	}
 	last := events[len(events)-1]
-	s.noteBudget(last)
-	if _, ok := last.Kind.(*pb.ChildEvent_Ok); ok {
+	if _, ok := last.Kind.(*pb.WorkerEvent_Ok); ok {
+		s.noteBudget(last)
 		return s, nil
 	}
-	if _, err := s.progress(ctx, events); err != nil {
+	if _, err := s.progress(ctx, events, false); err != nil {
 		_ = s.Close(ctx)
 		return nil, err
 	}
@@ -276,46 +341,60 @@ func (r *Runtime) newSession(ctx context.Context) (*Session, error) {
 
 func (r *Runtime) sessionFor(w *worker) *Session {
 	w.runs++
-	return &Session{rt: r, w: w, store: newObjectStore(), maxSuspensions: defaultMaxSuspensions, stdout: os.Stdout, stderr: os.Stderr}
+	return &Session{rt: r, w: w, store: newObjectStore(), maxSuspensions: defaultMaxSuspensions, sleepMax: defaultMaxSleep, stdout: os.Stdout, stderr: os.Stderr}
 }
 
 func (s *Session) codec() *codec { return &codec{store: s.store} }
 
 // send runs one turn, streaming prints to the session's current writers.
-func (s *Session) send(ctx context.Context, req *pb.ParentRequest) ([]*pb.ChildEvent, error) {
+func (s *Session) send(ctx context.Context, req *pb.ClientRequest) ([]*pb.WorkerEvent, error) {
 	return s.w.send(ctx, req, func(p *pb.Print) {
-		w := s.stdout
-		if p.GetStream() == pb.PrintStream_PRINT_STREAM_STDERR {
-			w = s.stderr
-		}
-		if w != nil {
-			_, _ = io.WriteString(w, p.GetText())
+		for _, seg := range p.GetSegments() {
+			w := s.stdout
+			if seg.GetStream() == pb.PrintStream_PRINT_STREAM_STDERR {
+				w = s.stderr
+			}
+			if w != nil {
+				_, _ = io.WriteString(w, seg.GetText())
+			}
 		}
 	})
 }
 
-func (s *Session) configure(ctx context.Context, opts SessionOptions) error {
-	if opts.Limits != nil && opts.Limits.MaxSuspensions > 0 {
-		s.maxSuspensions = opts.Limits.MaxSuspensions
-	} else {
-		s.maxSuspensions = defaultMaxSuspensions
+// budget resets the limits this package enforces itself to opts.
+func (s *Session) budget(opts SessionOptions) {
+	s.maxSuspensions = defaultMaxSuspensions
+	s.suspensions, s.sleepLimit, s.sleepUsed = 0, 0, 0
+	if opts.Limits != nil {
+		if opts.Limits.MaxSuspensions > 0 {
+			s.maxSuspensions = opts.Limits.MaxSuspensions
+		}
+		s.sleepLimit = opts.Limits.MaxSleep
 	}
-	events, err := s.send(ctx, &pb.ParentRequest{Kind: &pb.ParentRequest_Configure{Configure: opts.proto()}})
+	s.sleepMax = opts.OSPolicy.maxSleep()
+}
+
+func (s *Session) configure(ctx context.Context, opts SessionOptions) error {
+	s.budget(opts)
+	events, err := s.send(ctx, &pb.ClientRequest{Kind: &pb.ClientRequest_Configure{Configure: opts.proto()}})
 	if err != nil {
 		return err
 	}
 	return s.expectOk(events, "Configure")
 }
 
-func (s *Session) expectOk(events []*pb.ChildEvent, what string) error {
+func (s *Session) expectOk(events []*pb.WorkerEvent, what string) error {
 	last := events[len(events)-1]
 	s.noteBudget(last)
 	switch k := last.Kind.(type) {
-	case *pb.ChildEvent_Ok:
+	case *pb.WorkerEvent_Ok:
 		return nil
-	case *pb.ChildEvent_Error:
+	case *pb.WorkerEvent_Error:
 		return s.exception(k.Error.GetException())
-	case *pb.ChildEvent_FatalError:
+	case *pb.WorkerEvent_SessionRefused:
+		return fmt.Errorf("monty: session refused: %s", k.SessionRefused.GetMessage())
+	case *pb.WorkerEvent_FatalError:
+		s.w.dead = true
 		return &WorkerError{Message: k.FatalError.GetMessage(), Stderr: s.w.stderr.String()}
 	}
 	return &WorkerError{Message: fmt.Sprintf("unexpected reply to %s: %T", what, last.Kind)}
@@ -325,9 +404,14 @@ func (s *Session) exception(e *pb.RaisedException) *Exception {
 	return exceptionFromProto(e)
 }
 
-func (s *Session) noteBudget(ev *pb.ChildEvent) {
-	if ev.MaxSuspensions != nil && *ev.MaxSuspensions > 0 {
-		s.maxSuspensions = *ev.MaxSuspensions
+// noteBudget adopts what a reply reports. The limits a restored dump
+// carries can only tighten the configured ones.
+func (s *Session) noteBudget(ev *pb.WorkerEvent) {
+	if v := ev.GetMaxSuspensions(); v > 0 && v < s.maxSuspensions {
+		s.maxSuspensions = v
+	}
+	if v := time.Duration(ev.GetMaxTotalSleepMicros()) * time.Microsecond; v > 0 && (s.sleepLimit == 0 || v < s.sleepLimit) {
+		s.sleepLimit = v
 	}
 	if ev.TotalExecutionMicros > 0 {
 		s.executionTime = time.Duration(ev.TotalExecutionMicros) * time.Microsecond
@@ -336,8 +420,7 @@ func (s *Session) noteBudget(ev *pb.ChildEvent) {
 
 // ExecutionTime is the cumulative time the interpreter has spent executing
 // this session's code. It excludes time spent in host functions, accumulates
-// across runs, survives Dump and Restore, and is what Limits.MaxDuration
-// counts against.
+// across runs and survives Dump and Restore.
 func (s *Session) ExecutionTime() time.Duration {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -379,25 +462,26 @@ func (s *Session) start(ctx context.Context, code string, opts StartOptions) (*P
 		return nil, errors.New("monty: session is paused at a host call; answer it or Continue first")
 	}
 	s.setWriters(opts.Stdout, opts.Stderr)
-	c := s.codec()
-	inputs := make([]*pb.NamedValue, 0, len(opts.Inputs))
-	for name, v := range opts.Inputs {
-		obj, err := c.encode(v)
+	a := s.codec().arena()
+	inputs := make([]*pb.NamedRef, 0, len(opts.Inputs))
+	for _, name := range slices.Sorted(maps.Keys(opts.Inputs)) {
+		idx, err := a.encode(opts.Inputs[name])
 		if err != nil {
 			return nil, fmt.Errorf("monty: input %q: %w", name, err)
 		}
-		inputs = append(inputs, &pb.NamedValue{Name: name, Value: obj})
+		inputs = append(inputs, &pb.NamedRef{Name: name, Value: idx})
 	}
-	req := &pb.ParentRequest{Kind: &pb.ParentRequest_Feed{Feed: &pb.Feed{
+	req := &pb.ClientRequest{Kind: &pb.ClientRequest_Feed{Feed: &pb.Feed{
 		Code:          code,
 		Inputs:        inputs,
+		Values:        a.proto(),
 		SkipTypeCheck: opts.SkipTypeCheck,
 	}}}
 	events, err := s.send(ctx, req)
 	if err != nil {
 		return nil, err
 	}
-	return s.progress(ctx, events)
+	return s.progress(ctx, events, false)
 }
 
 // Run executes code in the session, answering every host call from opts,
@@ -408,11 +492,13 @@ func (s *Session) start(ctx context.Context, code string, opts StartOptions) (*P
 func (s *Session) Run(ctx context.Context, code string, opts RunOptions) (any, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	d := newDriver(s, &opts).own()
+	defer d.close()
 	p, err := s.start(ctx, code, opts.start())
 	if err != nil {
 		return nil, err
 	}
-	return s.drive(ctx, p, &opts)
+	return d.drive(ctx, p)
 }
 
 // Continue answers the pending host call of a paused (typically restored)
@@ -427,14 +513,16 @@ func (s *Session) Continue(ctx context.Context, opts RunOptions) (any, error) {
 		return nil, errors.New("monty: nothing to continue")
 	}
 	s.setWriters(opts.Stdout, opts.Stderr)
-	return s.drive(ctx, &Progress{Suspension: s.pending}, &opts)
+	d := newDriver(s, &opts).own()
+	defer d.close()
+	return d.drive(ctx, &Progress{Suspension: s.pending})
 }
 
-// drive resolves suspensions from opts until the run completes.
-func (s *Session) drive(ctx context.Context, p *Progress, opts *RunOptions) (any, error) {
-	d := newDriver(s, opts)
-	defer d.close()
-	// A paused child must always get an answer, or the next run would break
+// drive resolves suspensions from the driver's options until the run
+// completes.
+func (d *driver) drive(ctx context.Context, p *Progress) (any, error) {
+	s := d.s
+	// A paused worker must always get an answer, or the next run would break
 	// the protocol. If a host callback panics, abort the feed first.
 	defer func() {
 		if r := recover(); r != nil {
@@ -454,69 +542,135 @@ func (s *Session) drive(ctx context.Context, p *Progress, opts *RunOptions) (any
 }
 
 // progress classifies a turn's events into a Progress or an error, marking
-// the session paused when the turn ended in a host call.
-func (s *Session) progress(ctx context.Context, events []*pb.ChildEvent) (*Progress, error) {
+// the session paused when the turn ended in a host call. resumed says the
+// turn answered a suspension.
+func (s *Session) progress(ctx context.Context, events []*pb.WorkerEvent, resumed bool) (*Progress, error) {
 	last := events[len(events)-1]
 	s.noteBudget(last)
 	s.pending = nil
 	su := &Suspension{s: s}
 	switch k := last.Kind.(type) {
-	case *pb.ChildEvent_Complete:
-		v, err := s.codec().decode(k.Complete.GetValue())
+	case *pb.WorkerEvent_Complete:
+		vals, err := s.codec().decode(k.Complete.GetValues())
 		if err != nil {
-			return nil, err
+			return nil, &WorkerError{Message: err.Error()}
+		}
+		v, err := vals.at(k.Complete.GetValue())
+		if err != nil {
+			return nil, &WorkerError{Message: err.Error()}
 		}
 		return &Progress{Value: v}, nil
-	case *pb.ChildEvent_Error:
-		return nil, s.exception(k.Error.GetException())
-	case *pb.ChildEvent_TypingError:
-		return nil, &TypingError{Diagnostics: k.TypingError.GetDiagnostics()}
-	case *pb.ChildEvent_FatalError:
+	case *pb.WorkerEvent_Error:
+		return nil, s.failed(ctx, last, resumed, s.exception(k.Error.GetException()))
+	case *pb.WorkerEvent_TypingError:
+		return nil, s.failed(ctx, last, resumed, &TypingError{Diagnostics: k.TypingError.GetDiagnostics()})
+	case *pb.WorkerEvent_SessionRefused:
+		return nil, fmt.Errorf("monty: session refused: %s", k.SessionRefused.GetMessage())
+	case *pb.WorkerEvent_FatalError:
 		s.w.dead = true
 		return nil, &WorkerError{Message: k.FatalError.GetMessage(), Stderr: s.w.stderr.String()}
-	case *pb.ChildEvent_FunctionCall:
+	case *pb.WorkerEvent_FunctionCall:
 		fc := k.FunctionCall
 		su.Kind = SuspensionCall
 		su.CallID = fc.GetCallId()
 		su.Call = &Call{Name: fc.GetFunctionName()}
-		c := s.codec()
-		var err error
-		if su.Call.Args, err = c.decodeList(&pb.ObjectList{Items: fc.GetArgs()}); err != nil {
+		s.pending = su
+		vals, err := s.codec().decode(fc.GetValues())
+		if err != nil {
+			return nil, s.protocolError("decoding call values: %v", err)
+		}
+		if su.Call.Args, err = vals.list(fc.GetArgs()); err != nil {
 			return nil, s.protocolError("decoding call arguments: %v", err)
 		}
-		if su.Call.Kwargs, err = c.decodeStringDict(&pb.Dict{Pairs: fc.GetKwargs()}); err != nil {
+		if su.Call.Kwargs, err = vals.stringDict(fc.GetKwargs()); err != nil {
 			return nil, s.protocolError("decoding call keyword arguments: %v", err)
 		}
 		s.resolveReceiver(su, fc.GetObjectId())
-	case *pb.ChildEvent_NameLookup:
+	case *pb.WorkerEvent_NameLookup:
 		su.Kind = SuspensionLookup
 		su.Name = k.NameLookup.GetName()
 		s.resolveReceiver(su, k.NameLookup.GetObjectId())
-	case *pb.ChildEvent_OsCall:
-		call, err := osCallFromProto(k.OsCall)
+	case *pb.WorkerEvent_OsCall:
+		su.Kind = SuspensionOS
+		su.CallID = k.OsCall.GetCallId()
+		s.pending = su
+		call, err := s.codec().osCall(k.OsCall)
 		if err != nil {
 			return nil, s.protocolError("decoding OS call: %v", err)
 		}
-		su.Kind = SuspensionOS
-		su.CallID = k.OsCall.GetCallId()
 		su.OSCall = call
-	case *pb.ChildEvent_ResolveFutures:
+	case *pb.WorkerEvent_ResolveFutures:
 		su.Kind = SuspensionFutures
 		su.PendingCallIDs = k.ResolveFutures.GetPendingCallIds()
 	default:
 		return nil, &WorkerError{Message: fmt.Sprintf("unexpected event %T", last.Kind)}
 	}
 	s.pending = su
-	if su.Kind != SuspensionFutures {
-		s.suspensions++
-		if s.maxSuspensions > 0 && s.suspensions > s.maxSuspensions {
-			return su.answer(ctx, abortFeed("RuntimeError", fmt.Sprintf("suspension limit %d exceeded", s.maxSuspensions)))
+	s.suspensions++
+	if s.maxSuspensions > 0 && s.suspensions > s.maxSuspensions {
+		return su.answer(ctx, abortFeed("RuntimeError", fmt.Sprintf("suspension limit %d exceeded", s.maxSuspensions)))
+	}
+	if su.Kind == SuspensionOS {
+		switch {
+		case su.OSCall == nil:
+			// A call this package does not know raises the sandbox's default.
+			return su.decline(ctx)
+		case su.OSCall.Name == systemSleep, su.OSCall.Name == asyncSystemSleep:
+			return s.sleep(ctx, su)
 		}
 	}
 	return &Progress{Suspension: su}, nil
 }
 
-// protocolError reports a malformed suspension: the child is paused with a
+// failed returns err for a turn that ended in an error. A worker that
+// rejects an answer keeps the feed paused, and one that could not even
+// decode it does not say; the feed is then aborted so the session is idle
+// again. Aborting a feed that already ended is a harmless error reply.
+func (s *Session) failed(ctx context.Context, ev *pb.WorkerEvent, resumed bool, err error) error {
+	suspended := ev.GetFeedSuspended() || (resumed && ev.FeedSuspended == nil)
+	if !suspended || s.w.dead {
+		return err
+	}
+	events, aerr := s.send(context.WithoutCancel(ctx), abortFeed("RuntimeError", err.Error()))
+	if aerr != nil {
+		return aerr
+	}
+	if k, ok := events[len(events)-1].Kind.(*pb.WorkerEvent_FatalError); ok {
+		s.w.dead = true
+		return &WorkerError{Message: k.FatalError.GetMessage(), Stderr: s.w.stderr.String()}
+	}
+	return err
+}
+
+// sleep waits out a system sleep: capped per call, charged to the session's
+// sleep budget and never shown to an OSHandler. During a Run an
+// asyncio.sleep is deferred instead, so the sandbox's other tasks keep
+// running.
+func (s *Session) sleep(ctx context.Context, su *Suspension) (*Progress, error) {
+	d := time.Duration(su.OSCall.Seconds * float64(time.Second))
+	if d < 0 || d > s.sleepMax {
+		d = s.sleepMax
+	}
+	if total := s.sleepUsed + d; s.sleepLimit > 0 && total > s.sleepLimit {
+		return su.answer(ctx, abortFeed("TimeoutError", fmt.Sprintf("sleep limit exceeded: %v > %v", total, s.sleepLimit)))
+	}
+	s.sleepUsed += d
+	if s.driver != nil && su.OSCall.Name == asyncSystemSleep {
+		s.driver.sleep(su.CallID, d)
+		return su.deferCall(ctx)
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return su.ret(ctx, nil)
+	case <-ctx.Done():
+		_ = su.abort(context.WithoutCancel(ctx), "RuntimeError", "cancelled while sleeping")
+		return nil, context.Cause(ctx)
+	}
+}
+
+// protocolError reports a malformed suspension: the worker is paused with a
 // payload the host cannot interpret, so the feed is aborted.
 func (s *Session) protocolError(format string, args ...any) error {
 	msg := fmt.Sprintf(format, args...)
@@ -553,12 +707,12 @@ func (s *Session) dump(ctx context.Context) ([]byte, error) {
 	if s.closed {
 		return nil, ErrClosed
 	}
-	events, err := s.send(ctx, &pb.ParentRequest{Kind: &pb.ParentRequest_Dump{Dump: &pb.Dump{}}})
+	events, err := s.send(ctx, &pb.ClientRequest{Kind: &pb.ClientRequest_Dump{Dump: &pb.Dump{}}})
 	if err != nil {
 		return nil, err
 	}
 	last := events[len(events)-1]
-	if k, ok := last.Kind.(*pb.ChildEvent_DumpResult); ok {
+	if k, ok := last.Kind.(*pb.WorkerEvent_DumpResult); ok {
 		return k.DumpResult.GetState(), nil
 	}
 	return nil, s.expectOk(events, "Dump")
@@ -583,13 +737,24 @@ func (s *Session) reset(ctx context.Context) error {
 		s.pending.done = true
 		s.pending = nil
 	}
-	s.suspensions = 0
 	s.store = newObjectStore()
-	events, err := s.send(ctx, &pb.ParentRequest{Kind: &pb.ParentRequest_Reset_{Reset_: &pb.Reset{}}})
+	events, err := s.send(ctx, &pb.ClientRequest{Kind: &pb.ClientRequest_Reset_{Reset_: &pb.Reset{}}})
 	if err != nil {
 		return err
 	}
 	return s.expectOk(events, "Reset")
+}
+
+// Wait blocks until every AsyncFunctions call the session's runs started has
+// returned, and reports how many were still running. A call the code never
+// awaited outlives its run; it sees the run's context, so cancel that first
+// to stop such calls instead of letting them finish.
+func (s *Session) Wait() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	running := int(s.running.Load())
+	s.calls.Wait()
+	return running
 }
 
 // Close releases the sandbox instance, or hands it back to the Pool it came
@@ -688,25 +853,26 @@ func (su *Suspension) Return(ctx context.Context, value any) (*Progress, error) 
 }
 
 func (su *Suspension) ret(ctx context.Context, value any) (*Progress, error) {
+	a := su.s.codec().arena()
 	switch su.Kind {
 	case SuspensionLookup:
-		obj, err := su.s.codec().encode(value)
+		idx, err := a.encode(value)
 		if err != nil {
 			return su.raise(ctx, Raise("TypeError", "value for %q: %v", su.Name, err))
 		}
-		return su.answer(ctx, resumeLookup(&pb.ResumeNameLookup{Kind: &pb.ResumeNameLookup_Value{Value: obj}}))
+		return su.answer(ctx, resumeLookup(&pb.ResumeNameLookup{Values: a.proto(), Kind: &pb.ResumeNameLookup_Value{Value: idx}}))
 	case SuspensionCall, SuspensionOS:
-		var obj *pb.MontyObject
+		var idx uint32
 		var err error
 		if su.Kind == SuspensionOS {
-			obj, err = encodeOSResult(su.OSCall, value)
+			idx, err = a.osResult(su.OSCall, value)
 		} else {
-			obj, err = su.s.codec().encode(value)
+			idx, err = a.encode(value)
 		}
 		if err != nil {
 			return su.raise(ctx, Raise("TypeError", "host returned an unsupported value: %v", err))
 		}
-		return su.answer(ctx, resumeCall(su.CallID, &pb.ExtFunctionResult{Kind: &pb.ExtFunctionResult_ReturnValue{ReturnValue: obj}}))
+		return su.answer(ctx, resumeCall(su.CallID, &pb.ExtFunctionResult{Kind: &pb.ExtFunctionResult_ReturnValue{ReturnValue: idx}}, a))
 	}
 	return nil, errors.New("monty: Return is not valid for a futures suspension; use Settle")
 }
@@ -727,7 +893,7 @@ func (su *Suspension) raise(ctx context.Context, err error) (*Progress, error) {
 	case SuspensionLookup:
 		return su.answer(ctx, resumeLookup(&pb.ResumeNameLookup{Kind: &pb.ResumeNameLookup_Error{Error: raisedFromError(err)}}))
 	case SuspensionCall, SuspensionOS:
-		return su.answer(ctx, resumeCall(su.CallID, callError(err)))
+		return su.answer(ctx, resumeCall(su.CallID, callError(err), nil))
 	}
 	exc := raisedFromError(err)
 	return su.answer(ctx, abortFeed(exc.GetExcType(), exc.GetMessage()))
@@ -753,9 +919,9 @@ func (su *Suspension) decline(ctx context.Context) (*Progress, error) {
 		if su.Object != nil || su.Class != nil || su.ObjectID != "" {
 			return su.raise(ctx, Raise("AttributeError", "'%s' object has no attribute '%s'", su.receiverName(), su.Call.Name))
 		}
-		return su.answer(ctx, resumeCall(su.CallID, &pb.ExtFunctionResult{Kind: &pb.ExtFunctionResult_NotFound{NotFound: su.Call.Name}}))
+		return su.answer(ctx, resumeCall(su.CallID, &pb.ExtFunctionResult{Kind: &pb.ExtFunctionResult_NotFound{NotFound: su.Call.Name}}, nil))
 	case SuspensionOS:
-		return su.answer(ctx, resumeCall(su.CallID, &pb.ExtFunctionResult{Kind: &pb.ExtFunctionResult_NotHandled{NotHandled: unit()}}))
+		return su.answer(ctx, resumeCall(su.CallID, &pb.ExtFunctionResult{Kind: &pb.ExtFunctionResult_NotHandled{NotHandled: unit()}}, nil))
 	}
 	return nil, errors.New("monty: Decline is not valid for a futures suspension; use Settle")
 }
@@ -776,7 +942,7 @@ func (su *Suspension) deferCall(ctx context.Context) (*Progress, error) {
 	if su.Kind != SuspensionCall && su.Kind != SuspensionOS {
 		return nil, errors.New("monty: only calls can be deferred")
 	}
-	return su.answer(ctx, resumeCall(su.CallID, &pb.ExtFunctionResult{Kind: &pb.ExtFunctionResult_Future{Future: su.CallID}}))
+	return su.answer(ctx, resumeCall(su.CallID, &pb.ExtFunctionResult{Kind: &pb.ExtFunctionResult_Future{Future: su.CallID}}, nil))
 }
 
 // Settle resumes a SuspensionFutures run with the outcomes of some or all of
@@ -797,20 +963,21 @@ func (su *Suspension) settle(ctx context.Context, results map[uint32]Result) (*P
 	if len(results) == 0 {
 		return nil, errors.New("monty: Settle needs at least one result")
 	}
-	c := su.s.codec()
+	a := su.s.codec().arena()
 	out := make([]*pb.FutureResult, 0, len(results))
-	for id, r := range results {
+	for _, id := range slices.Sorted(maps.Keys(results)) {
+		r := results[id]
 		var res *pb.ExtFunctionResult
 		if r.Err != nil {
 			res = callError(r.Err)
-		} else if obj, err := c.encode(r.Value); err != nil {
+		} else if idx, err := a.encode(r.Value); err != nil {
 			res = callError(Raise("TypeError", "host returned an unsupported value: %v", err))
 		} else {
-			res = &pb.ExtFunctionResult{Kind: &pb.ExtFunctionResult_ReturnValue{ReturnValue: obj}}
+			res = &pb.ExtFunctionResult{Kind: &pb.ExtFunctionResult_ReturnValue{ReturnValue: idx}}
 		}
 		out = append(out, &pb.FutureResult{CallId: id, Result: res})
 	}
-	return su.answer(ctx, &pb.ParentRequest{Kind: &pb.ParentRequest_ResumeFutures{ResumeFutures: &pb.ResumeFutures{Results: out}}})
+	return su.answer(ctx, &pb.ClientRequest{Kind: &pb.ClientRequest_ResumeFutures{ResumeFutures: &pb.ResumeFutures{Results: out, Values: a.proto()}}})
 }
 
 // Dump serialises the paused run; Runtime.Restore returns a session paused
@@ -863,7 +1030,7 @@ func (su *Suspension) abort(ctx context.Context, excType, message string) error 
 }
 
 // answer sends the reply for this suspension and classifies what follows.
-func (su *Suspension) answer(ctx context.Context, req *pb.ParentRequest) (*Progress, error) {
+func (su *Suspension) answer(ctx context.Context, req *pb.ClientRequest) (*Progress, error) {
 	su.done = true
 	events, err := su.s.send(ctx, req)
 	if err != nil && !su.s.w.dead {
@@ -875,23 +1042,26 @@ func (su *Suspension) answer(ctx context.Context, req *pb.ParentRequest) (*Progr
 		su.s.pending = nil
 		return nil, err
 	}
-	return su.s.progress(ctx, events)
+	return su.s.progress(ctx, events, true)
 }
 
-func abortFeed(excType, message string) *pb.ParentRequest {
-	return &pb.ParentRequest{Kind: &pb.ParentRequest_AbortFeed{AbortFeed: &pb.AbortFeed{
+func abortFeed(excType, message string) *pb.ClientRequest {
+	return &pb.ClientRequest{Kind: &pb.ClientRequest_AbortFeed{AbortFeed: &pb.AbortFeed{
 		Exception: &pb.RaisedException{ExcType: excType, Message: &message},
 	}}}
 }
 
-func resumeCall(callID uint32, result *pb.ExtFunctionResult) *pb.ParentRequest {
-	return &pb.ParentRequest{Kind: &pb.ParentRequest_ResumeCall{ResumeCall: &pb.ResumeCall{
-		CallId: callID, Result: result,
-	}}}
+// resumeCall answers a call; a holds the returned value, if any.
+func resumeCall(callID uint32, result *pb.ExtFunctionResult, a *arena) *pb.ClientRequest {
+	resume := &pb.ResumeCall{CallId: callID, Result: result}
+	if a != nil {
+		resume.Values = a.proto()
+	}
+	return &pb.ClientRequest{Kind: &pb.ClientRequest_ResumeCall{ResumeCall: resume}}
 }
 
-func resumeLookup(answer *pb.ResumeNameLookup) *pb.ParentRequest {
-	return &pb.ParentRequest{Kind: &pb.ParentRequest_ResumeNameLookup{ResumeNameLookup: answer}}
+func resumeLookup(answer *pb.ResumeNameLookup) *pb.ClientRequest {
+	return &pb.ClientRequest{Kind: &pb.ClientRequest_ResumeNameLookup{ResumeNameLookup: answer}}
 }
 
 func callError(err error) *pb.ExtFunctionResult {
@@ -930,8 +1100,40 @@ func newDriver(s *Session, opts *RunOptions) *driver {
 	}
 }
 
-// close abandons outstanding goroutines; they exit at their next send.
-func (d *driver) close() { close(d.done) }
+// own makes d the session's driver until close: a run that resolves every
+// suspension can wait out an asyncio.sleep in the background. A single
+// Resolve cannot, since nothing would settle the sleep afterwards.
+func (d *driver) own() *driver {
+	d.s.driver = d
+	return d
+}
+
+// close abandons outstanding goroutines; they exit at their next send, once
+// their call has returned. Session.Wait joins those calls.
+func (d *driver) close() {
+	if d.s.driver == d {
+		d.s.driver = nil
+	}
+	close(d.done)
+}
+
+// sleep settles the deferred call id once delay has passed.
+func (d *driver) sleep(id uint32, delay time.Duration) {
+	d.pending[id] = true
+	go func() {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-d.done:
+			return
+		}
+		select {
+		case d.results <- futureResult{id: id}:
+		case <-d.done:
+		}
+	}()
+}
 
 func (d *driver) resolve(ctx context.Context, su *Suspension) (*Progress, error) {
 	switch su.Kind {
@@ -972,8 +1174,13 @@ func (d *driver) resolveCall(ctx context.Context, su *Suspension) (*Progress, er
 		fn := d.opts.AsyncFunctions[name]
 		id, call := su.CallID, su.Call
 		d.pending[id] = true
+		// Counted here, not in the goroutine: the run can end before it starts.
+		d.s.calls.Add(1)
+		d.s.running.Add(1)
 		go func() {
 			v, err := fn(ctx, call)
+			d.s.running.Add(-1)
+			d.s.calls.Done()
 			select {
 			case d.results <- futureResult{id: id, res: Result{Value: v, Err: err}}:
 			case <-d.done:

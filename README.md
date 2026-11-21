@@ -65,9 +65,10 @@ func main() {
 ## What Monty is (and is not)
 
 Monty runs the glue code a model writes: loops, branching, `json`, `math`,
-`datetime`, `re`, `dataclasses`, `asyncio.gather`, and calls to the host
-functions you expose. It starts in milliseconds, can be paused and restored,
-and enforces memory, time and recursion limits itself. It implements a
+`datetime`, `re`, `dataclasses`, `asyncio.gather`, top-level `await`, and
+calls to the host functions you expose. It starts in under a millisecond, can
+be paused and restored, and enforces memory, time and recursion limits
+itself. It implements a
 [subset of Python](https://pydantic.dev/docs/monty/limitations/): no third-party
 packages, no `pip`, no class inheritance, no generators.
 
@@ -86,12 +87,12 @@ packages, no `pip`, no class inheritance, no generators.
 
 | | |
 |---|---|
-| `NewRuntime(ctx, opts...)` | Compiles the embedded module once per process. `WithCacheDir` keeps the compiled code on disk (4 s cold, 150 ms cached), `WithInterpreter` avoids native codegen, `WithMemoryLimit` walls each instance, `WithModule` swaps the wasm. |
-| `rt.NewSession(ctx, SessionOptions)` | A Python REPL on its own wasm instance (~2 ms). Globals persist across runs. `Limits` bounds execution time, memory, recursion depth and host calls; `TypeCheck` with `TypeCheckStubs` rejects unsupported or mistyped code before it runs. |
+| `NewRuntime(ctx, opts...)` | Compiles the embedded module once per process. `WithCacheDir` keeps the compiled code on disk (6 s cold, 0.2 s cached), `WithInterpreter` avoids native codegen, `WithMemoryLimit` walls each instance, `WithModule` swaps the wasm. |
+| `rt.NewSession(ctx, SessionOptions)` | A Python REPL on its own wasm instance (~0.4 ms). Globals persist across runs. `Limits` bounds execution time, memory, recursion depth, host calls and sleeps; `TypeCheck` with `TypeCheckStubs` rejects unsupported or mistyped code before it runs; `OSPolicy` picks the clock, timezone, sleep behaviour and random seed. |
 | `rt.NewPool(ctx, PoolOptions)` | Warm instances so `pool.Checkout` returns a session in ~10 µs. Sessions return to the pool on `Close`; the pool recycles instances that aged or grew (wasm memory never shrinks). |
 | `session.Run(ctx, code, RunOptions)` | Executes code, answering every host call from `RunOptions`, and returns the value of the last expression statement. |
-| `session.Dump(ctx)` / `rt.Restore(ctx, state)` | Snapshot a session to bytes and restore it, in this or another process. Works between runs and while paused at a host call. |
-| `session.Reset`, `session.ExecutionTime` | Reuse the instance with fresh state; read the cumulative interpreter time `MaxDuration` counts against. |
+| `session.Dump(ctx)` / `rt.Restore(ctx, state, opts...)` | Snapshot a session to bytes and restore it, in this or another process. Works between runs and while paused at a host call. The dump carries the limits; pass the `SessionOptions` again to restore the `OSPolicy`. |
+| `session.Reset`, `session.ExecutionTime` | Reuse the instance with fresh state; read the cumulative time the interpreter has run. |
 
 Errors from `Run` are typed: `*monty.Exception` when Python raised (with
 `Type`, `Message`, a rendered `Traceback`, `Frames`, and `Data` for
@@ -105,8 +106,8 @@ session returns `monty.ErrClosed`; create a new one.
 | | |
 |---|---|
 | `Inputs` | Bound as globals before the code runs. |
-| `Functions` | Go functions callable by name. Each call pauses the sandbox until it returns. Return `monty.Raise("ValueError", ...)` to raise a specific exception. |
-| `AsyncFunctions` | Like `Functions`, but each call runs in its own goroutine while the sandbox continues. `await asyncio.gather(f(a), f(b))` runs them concurrently. |
+| `Functions` | Go functions callable by name. Each call pauses the sandbox until it returns. Return `monty.Raise("ValueError", ...)` to raise a specific exception. A function named like a Python builtin (`open`, `exec`) replaces it. |
+| `AsyncFunctions` | Like `Functions`, but each call runs in its own goroutine while the sandbox continues. `await asyncio.gather(f(a), f(b))` runs them concurrently, at the top level too. A call the code never awaits outlives the run; `session.Wait()` joins such calls and reports how many were still running. |
 | `Values` | Converted lazily when the code reads the name. May hold `*HostObject` and `*HostClass`. |
 | `OS` | Filesystem, environment and clock requests; see below. |
 | `Stdout`, `Stderr` | Receive `print()` output as it happens, not at the end of the run. |
@@ -134,6 +135,34 @@ result, err := session.Run(ctx, code, reg.Options(monty.RunOptions{}))
 prompt := reg.Prompt() // the same declarations with docstrings, for the model
 ```
 
+### Tools described by JSON Schema
+
+MCP and function-calling tools come with a JSON Schema instead of a Go
+signature. `AddSchema` turns one into a function with keyword-only
+parameters: objects become `TypedDict`s whose fields keep their descriptions
+as comments, enums `Literal`s, optional properties default to `None`, and
+local `$ref`s are followed. The handler
+receives the arguments as JSON-compatible values under the schema's property
+names. Names that are not Python identifiers are adapted (`issue-list`
+becomes `issue_list`, `from` becomes `from_`); read the result from
+`Tool.Name`.
+
+```go
+reg.AddSchema(tools.Schema{
+	Name:        "search_issues",
+	Description: "Search issues in a repository.",
+	Input:       inputSchema,  // map[string]any
+	Output:      outputSchema, // optional; nil means Any
+	Async:       true,
+}, func(ctx context.Context, args map[string]any) (any, error) {
+	return client.Call(ctx, "search_issues", args)
+})
+```
+
+`reg.Describe(names...)` renders only the named tools with docstrings, and
+`reg.Signatures(names...)` only their declarations, for a model that should
+see a few tools rather than all of them.
+
 ### Host objects
 
 `monty.HostClass` and `monty.HostObject` put a Go-backed object, or class, in
@@ -160,6 +189,23 @@ restored, _ := rt.Restore(ctx, state)
 p, _ = restored.Pending().Return(ctx, "approved")
 ```
 
+### Clock, sleep and randomness
+
+`SessionOptions.OSPolicy` says where these come from. By default the sandbox
+reads the real clock in UTC, seeds `random` from OS entropy, and
+`time.sleep()` / `asyncio.sleep()` wait on the host: at most ten seconds per
+call, and `Limits.MaxSleep` in total. Sleeps awaited together overlap.
+
+```go
+monty.SessionOptions{OSPolicy: monty.OSPolicy{
+	Clock:     monty.ClockFixed, // or ClockHost: ask RunOptions.OS
+	FixedTime: time.Date(2030, 5, 6, 7, 8, 9, 0, time.UTC),
+	TimeZone:  zurich,           // what naive datetimes read in
+	Sleep:     monty.SleepNone,  // or SleepHost
+	Random:    monty.RandomSeeded, Seed: 42,
+}}
+```
+
 ### Filesystem, environment and clock
 
 Sandbox code sees no filesystem unless you mount one. `monty.FS` serves
@@ -180,10 +226,14 @@ _, err := session.Run(ctx, code, monty.RunOptions{
 		monty.NewFS("/tmp", monty.NewMemFS(nil)),
 		monty.NewFS("/repo", monty.NewOverlay(repoFS)),
 		monty.Env(map[string]string{"LANG": "en"}),
-		monty.Clock(time.Now),
 	),
 })
 ```
+
+`os.walk`, `os.scandir` and `Path.glob` work on every mount. `monty.Clock(fn)`
+answers clock reads in a session whose `OSPolicy.Clock` is `ClockHost`. An
+`OSHandler` can also serve `import` of a module the sandbox does not have by
+returning a `*monty.Module`.
 
 `Handlers` tries each handler in turn; anything outside every mount raises
 `PermissionError`. Write your own `OSHandler` for anything else (see `OSCall`).
@@ -192,7 +242,8 @@ _, err := session.Run(ctx, code, monty.RunOptions{
 
 A context deadline on `Run` is a hard stop that kills the instance; prefer
 `Limits.MaxDuration`, which raises `TimeoutError` inside the sandbox and keeps
-the session usable. Keep `MaxRecursionDepth` near its default of 1000:
+the session usable. It bounds one run, not the session, and counts only the
+time the interpreter itself runs, not the time spent in host functions. Keep `MaxRecursionDepth` near its default of 1000:
 unwinding an exception through tens of thousands of frames is slow, and the
 time limit is only checked between frames. If a host function panics, the
 panic propagates to the caller after the feed has been aborted inside the
@@ -203,12 +254,12 @@ sandbox, so the session stays usable.
 ```
 Go ── protobuf frame ──▶ wazero ──▶ monty_dispatch()  (rust/src/lib.rs)
                                         │
-                                   monty-proto Child   (upstream state machine)
+                                   monty-proto Worker  (upstream state machine)
                                         │
 Go ◀── monty.event import ◀─────────────┘  each print and turn-ending event, as it happens
 ```
 
-Monty ships a transport-agnostic protocol child (the same one behind
+Monty ships a transport-agnostic protocol worker (the same one behind
 `monty subprocess` and the browser build) that consumes one protobuf request
 and emits the events of that turn. `rust/` wraps it in a small core wasm
 module with a C ABI; Go drives it over the
@@ -235,7 +286,11 @@ make build-wasm             # cargo build, copy to internal/wasm/monty.wasm
 make test
 ```
 
-The module is ~19 MB, most of it the type checker (ty) and its typeshed stubs.
+The module tracks Monty 1.6.0 and is ~24 MB (8 MB compressed), most of it the
+type checker (ty) and its typeshed stubs. `cargo` must be the rustup proxy,
+which puts the toolchain's `libLLVM` where `rust-lld` finds it; a `cargo`
+called straight from a toolchain directory needs
+`DYLD_FALLBACK_LIBRARY_PATH=<toolchain>/lib` on macOS.
 
 ## License
 

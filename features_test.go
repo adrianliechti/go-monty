@@ -78,6 +78,34 @@ func TestSuspensionAnsweredOnce(t *testing.T) {
 	}
 }
 
+// A call the code never awaits may not even have started when Run returns.
+// Wait must still count it and see it through.
+func TestWaitJoinsUnawaitedAsyncCalls(t *testing.T) {
+	ctx := context.Background()
+	s := newSession(t, monty.SessionOptions{})
+	var finished atomic.Int32
+	slow := func(ctx context.Context, call *monty.Call) (any, error) {
+		time.Sleep(20 * time.Millisecond)
+		finished.Add(1)
+		return nil, nil
+	}
+	options := monty.RunOptions{AsyncFunctions: map[string]monty.Function{"slow": slow}}
+	out, err := s.Run(ctx, "kept = [slow(), slow()]\n'done'", options)
+	if err != nil || out != "done" {
+		t.Fatalf("run: %v %v", out, err)
+	}
+	if running := s.Wait(); running != 2 || finished.Load() != 2 {
+		t.Fatalf("running = %d, finished = %d", running, finished.Load())
+	}
+	// Awaited calls have returned by the time the run does.
+	if _, err := s.Run(ctx, "await slow()", options); err != nil {
+		t.Fatal(err)
+	}
+	if running := s.Wait(); running != 0 || finished.Load() != 3 {
+		t.Fatalf("running = %d, finished = %d", running, finished.Load())
+	}
+}
+
 func TestAsyncFunctionsGather(t *testing.T) {
 	ctx := context.Background()
 	s := newSession(t, monty.SessionOptions{})

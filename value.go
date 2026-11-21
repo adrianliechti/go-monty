@@ -40,6 +40,9 @@ import (
 //	FunctionRef                 external function
 //	TypeRef (builtin)           type
 //	NamedTuple                  named tuple
+//	complex64, complex128       complex
+//	Decimal                     decimal.Decimal
+//	*Module                     module
 //
 // Python → Go (results, host function arguments):
 //
@@ -63,6 +66,9 @@ import (
 //	function, builtin function  FunctionRef
 //	pathlib.Path                Path
 //	file handle                 FileHandle
+//	complex                     complex128
+//	decimal.Decimal             Decimal
+//	module                      *Module
 //	anything else               Repr (its repr() string)
 
 // Tuple is a Python tuple.
@@ -161,6 +167,19 @@ type ClassInstance struct {
 	Attrs map[string]any
 }
 
+// Decimal is a decimal.Decimal as its canonical string, str(d).
+type Decimal string
+
+// Module is a host module: sandbox code that imports it reads Attrs as the
+// module's attributes. Return one from an OSHandler's "import" call.
+type Module struct {
+	// Name is the dotted module name.
+	Name  string
+	Attrs map[string]any
+
+	id string
+}
+
 // FileHandle is an open() result: purely virtual state, never a host file.
 type FileHandle struct {
 	Path     string
@@ -173,12 +192,6 @@ type FileHandle struct {
 type codec struct {
 	store *objectStore
 }
-
-// encode converts a plain Go value; host objects need a session codec.
-func encode(v any) (*pb.MontyObject, error) { return (&codec{}).encode(v) }
-
-// decode converts a wire value outside any session.
-func decode(obj *pb.MontyObject) (any, error) { return (&codec{}).decode(obj) }
 
 type ellipsis struct{}
 type notImplemented struct{}
@@ -198,74 +211,116 @@ var NotImplemented any = notImplemented{}
 
 func unit() *pb.Unit { return &pb.Unit{} }
 
-func encodeInt(i int64) *pb.MontyObject {
-	return &pb.MontyObject{Kind: &pb.MontyObject_Int{Int: i}}
+// arena collects the values of one message. Nodes are in post-order: every
+// container is appended after its children and names them by index.
+type arena struct {
+	c     *codec
+	nodes []*pb.MontyNode
+	// classes shares one type node between the instances of a host class.
+	classes map[*HostClass]uint32
+	// sent lists the classes whose Attrs this arena carries.
+	sent []*HostClass
 }
 
-func encodeStr(s string) *pb.MontyObject {
-	return &pb.MontyObject{Kind: &pb.MontyObject_Str{Str: s}}
+func (c *codec) arena() *arena { return &arena{c: c} }
+
+func (a *arena) proto() *pb.Arena {
+	return &pb.Arena{NodeCount: uint32(len(a.nodes)), Nodes: a.nodes}
 }
 
-func encodeBig(b *big.Int) *pb.MontyObject {
-	if b.IsInt64() {
-		return encodeInt(b.Int64())
+func (a *arena) push(n *pb.MontyNode) uint32 {
+	a.nodes = append(a.nodes, n)
+	return uint32(len(a.nodes) - 1)
+}
+
+// encode appends v and returns its index. A failed value leaves no nodes.
+func (a *arena) encode(v any) (uint32, error) {
+	mark, sent := len(a.nodes), len(a.sent)
+	idx, err := a.node(v)
+	if err != nil {
+		a.nodes = a.nodes[:mark]
+		for cl, i := range a.classes {
+			if int(i) >= mark {
+				delete(a.classes, cl)
+			}
+		}
+		for _, cl := range a.sent[sent:] {
+			delete(a.c.store.sentClasses, cl.ID())
+		}
+		a.sent = a.sent[:sent]
 	}
-	mag := new(big.Int).Abs(b)
-	return &pb.MontyObject{Kind: &pb.MontyObject_Bigint{Bigint: &pb.BigInt{
-		Negative:  b.Sign() < 0,
-		Magnitude: mag.Bytes(),
-	}}}
+	return idx, err
 }
 
-func (c *codec) encodeList(items []any) (*pb.ObjectList, error) {
-	out := make([]*pb.MontyObject, 0, len(items))
+func (a *arena) indexes(items []any) (*pb.Indexes, error) {
+	out := make([]uint32, len(items))
 	for i, item := range items {
-		obj, err := c.encode(item)
+		idx, err := a.node(item)
 		if err != nil {
 			return nil, fmt.Errorf("item %d: %w", i, err)
 		}
-		out = append(out, obj)
+		out[i] = idx
 	}
-	return &pb.ObjectList{Items: out}, nil
+	return &pb.Indexes{Items: out}, nil
 }
 
-func (c *codec) encodeStringMap(m map[string]any) (*pb.Dict, error) {
+func (a *arena) stringMap(m map[string]any) (*pb.NodePairs, error) {
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	pairs := make([]*pb.Pair, 0, len(keys))
+	pairs := make([]*pb.NodePair, 0, len(keys))
 	for _, k := range keys {
-		v, err := c.encode(m[k])
+		if !utf8.ValidString(k) {
+			return nil, fmt.Errorf("key %q: not valid UTF-8", k)
+		}
+		v, err := a.node(m[k])
 		if err != nil {
 			return nil, fmt.Errorf("key %q: %w", k, err)
 		}
-		pairs = append(pairs, &pb.Pair{Key: encodeStr(k), Value: v})
+		pairs = append(pairs, &pb.NodePair{Key: a.push(strNode(k)), Value: v})
 	}
-	return &pb.Dict{Pairs: pairs}, nil
+	return &pb.NodePairs{Pairs: pairs}, nil
 }
 
-func encodeTime(t time.Time) *pb.MontyObject {
-	name, offset := t.Zone()
-	off := int32(offset)
+func strNode(s string) *pb.MontyNode { return &pb.MontyNode{Kind: &pb.MontyNode_Str{Str: s}} }
+
+func intNode(i int64) *pb.MontyNode { return &pb.MontyNode{Kind: &pb.MontyNode_Int{Int: i}} }
+
+func bigNode(b *big.Int) *pb.MontyNode {
+	if b.IsInt64() {
+		return intNode(b.Int64())
+	}
+	return &pb.MontyNode{Kind: &pb.MontyNode_Bigint{Bigint: &pb.BigInt{
+		Negative:  b.Sign() < 0,
+		Magnitude: new(big.Int).Abs(b).Bytes(),
+	}}}
+}
+
+// timeNode builds a datetime; naive drops the zone.
+func timeNode(t time.Time, naive bool) *pb.MontyNode {
 	dt := &pb.DateTime{
-		Year:          int32(t.Year()),
-		Month:         uint32(t.Month()),
-		Day:           uint32(t.Day()),
-		Hour:          uint32(t.Hour()),
-		Minute:        uint32(t.Minute()),
-		Second:        uint32(t.Second()),
-		Microsecond:   uint32(t.Nanosecond() / 1000),
-		OffsetSeconds: &off,
+		Year:        int32(t.Year()),
+		Month:       uint32(t.Month()),
+		Day:         uint32(t.Day()),
+		Hour:        uint32(t.Hour()),
+		Minute:      uint32(t.Minute()),
+		Second:      uint32(t.Second()),
+		Microsecond: uint32(t.Nanosecond() / 1000),
 	}
-	if name != "" {
-		dt.TimezoneName = &name
+	if !naive {
+		name, offset := t.Zone()
+		off := int32(offset)
+		dt.OffsetSeconds = &off
+		if name != "" {
+			dt.TimezoneName = &name
+		}
 	}
-	return &pb.MontyObject{Kind: &pb.MontyObject_Datetime{Datetime: dt}}
+	return &pb.MontyNode{Kind: &pb.MontyNode_Datetime{Datetime: dt}}
 }
 
-func encodeDuration(d time.Duration) *pb.MontyObject {
+func durationNode(d time.Duration) *pb.MontyNode {
 	micros := d.Microseconds()
 	days := micros / (86400 * 1_000_000)
 	micros -= days * 86400 * 1_000_000
@@ -275,136 +330,100 @@ func encodeDuration(d time.Duration) *pb.MontyObject {
 	}
 	secs := micros / 1_000_000
 	micros -= secs * 1_000_000
-	return &pb.MontyObject{Kind: &pb.MontyObject_Timedelta{Timedelta: &pb.TimeDelta{
+	return &pb.MontyNode{Kind: &pb.MontyNode_Timedelta{Timedelta: &pb.TimeDelta{
 		Days: int32(days), Seconds: int32(secs), Microseconds: int32(micros),
 	}}}
 }
 
-func encodeException(e *Exception) *pb.MontyObject {
+func exceptionNode(e *Exception) *pb.MontyNode {
 	exc := &pb.Exception{ExcType: e.Type}
 	if e.Message != "" {
 		msg := e.Message
 		exc.Arg = &msg
 	}
-	return &pb.MontyObject{Kind: &pb.MontyObject_Exception{Exception: exc}}
+	return &pb.MontyNode{Kind: &pb.MontyNode_Exception{Exception: exc}}
 }
 
-// encode converts a Go value into its wire representation.
-func (c *codec) encode(v any) (*pb.MontyObject, error) {
+func timezoneProto(loc *time.Location) *pb.TimeZone {
+	name, offset := time.Now().In(loc).Zone()
+	tz := &pb.TimeZone{OffsetSeconds: int32(offset)}
+	if name != "" {
+		tz.Name = &name
+	}
+	return tz
+}
+
+// leaf converts the values that have no children; ok is false for the rest.
+func leaf(v any) (n *pb.MontyNode, ok bool, err error) {
 	switch x := v.(type) {
 	case nil:
-		return &pb.MontyObject{Kind: &pb.MontyObject_None{None: unit()}}, nil
+		n = &pb.MontyNode{Kind: &pb.MontyNode_None{None: unit()}}
 	case bool:
-		return &pb.MontyObject{Kind: &pb.MontyObject_Boolean{Boolean: x}}, nil
+		n = &pb.MontyNode{Kind: &pb.MontyNode_Boolean{Boolean: x}}
 	case int:
-		return encodeInt(int64(x)), nil
+		n = intNode(int64(x))
 	case int8:
-		return encodeInt(int64(x)), nil
+		n = intNode(int64(x))
 	case int16:
-		return encodeInt(int64(x)), nil
+		n = intNode(int64(x))
 	case int32:
-		return encodeInt(int64(x)), nil
+		n = intNode(int64(x))
 	case int64:
-		return encodeInt(x), nil
+		n = intNode(x)
 	case uint:
-		return encodeBig(new(big.Int).SetUint64(uint64(x))), nil
+		n = bigNode(new(big.Int).SetUint64(uint64(x)))
 	case uint8:
-		return encodeInt(int64(x)), nil
+		n = intNode(int64(x))
 	case uint16:
-		return encodeInt(int64(x)), nil
+		n = intNode(int64(x))
 	case uint32:
-		return encodeInt(int64(x)), nil
+		n = intNode(int64(x))
 	case uint64:
-		return encodeBig(new(big.Int).SetUint64(x)), nil
+		n = bigNode(new(big.Int).SetUint64(x))
 	case uintptr:
-		return encodeBig(new(big.Int).SetUint64(uint64(x))), nil
+		n = bigNode(new(big.Int).SetUint64(uint64(x)))
 	case *big.Int:
 		if x == nil {
-			return c.encode(nil)
+			return leaf(nil)
 		}
-		return encodeBig(x), nil
+		n = bigNode(x)
 	case big.Int:
-		return encodeBig(&x), nil
+		n = bigNode(&x)
 	case float32:
-		return &pb.MontyObject{Kind: &pb.MontyObject_Float{Float: float64(x)}}, nil
+		n = &pb.MontyNode{Kind: &pb.MontyNode_Float{Float: float64(x)}}
 	case float64:
-		return &pb.MontyObject{Kind: &pb.MontyObject_Float{Float: x}}, nil
+		n = &pb.MontyNode{Kind: &pb.MontyNode_Float{Float: x}}
+	case complex64:
+		return leaf(complex128(x))
+	case complex128:
+		re, im := real(x), imag(x)
+		n = &pb.MontyNode{Kind: &pb.MontyNode_Complex{Complex: &pb.Complex{Real: &re, Imag: &im}}}
 	case string:
 		if !utf8.ValidString(x) {
-			return nil, fmt.Errorf("monty: string is not valid UTF-8")
+			return nil, true, fmt.Errorf("monty: string is not valid UTF-8")
 		}
-		return encodeStr(x), nil
+		n = strNode(x)
 	case []byte:
-		return &pb.MontyObject{Kind: &pb.MontyObject_Bytes{Bytes: x}}, nil
-	case []any:
-		l, err := c.encodeList(x)
-		if err != nil {
-			return nil, err
-		}
-		return &pb.MontyObject{Kind: &pb.MontyObject_List{List: l}}, nil
-	case Tuple:
-		l, err := c.encodeList(x)
-		if err != nil {
-			return nil, err
-		}
-		return &pb.MontyObject{Kind: &pb.MontyObject_Tuple{Tuple: l}}, nil
-	case Set:
-		l, err := c.encodeList(x)
-		if err != nil {
-			return nil, err
-		}
-		return &pb.MontyObject{Kind: &pb.MontyObject_Set{Set: l}}, nil
-	case FrozenSet:
-		l, err := c.encodeList(x)
-		if err != nil {
-			return nil, err
-		}
-		return &pb.MontyObject{Kind: &pb.MontyObject_FrozenSet{FrozenSet: l}}, nil
-	case map[string]any:
-		d, err := c.encodeStringMap(x)
-		if err != nil {
-			return nil, err
-		}
-		return &pb.MontyObject{Kind: &pb.MontyObject_Dict{Dict: d}}, nil
-	case Dict:
-		pairs := make([]*pb.Pair, 0, len(x))
-		for i, item := range x {
-			k, err := c.encode(item.Key)
-			if err != nil {
-				return nil, fmt.Errorf("dict key %d: %w", i, err)
-			}
-			val, err := c.encode(item.Value)
-			if err != nil {
-				return nil, fmt.Errorf("dict value %d: %w", i, err)
-			}
-			pairs = append(pairs, &pb.Pair{Key: k, Value: val})
-		}
-		return &pb.MontyObject{Kind: &pb.MontyObject_Dict{Dict: &pb.Dict{Pairs: pairs}}}, nil
-	case NamedTuple:
-		l, err := c.encodeList(x.Values)
-		if err != nil {
-			return nil, err
-		}
-		return &pb.MontyObject{Kind: &pb.MontyObject_NamedTuple{NamedTuple: &pb.NamedTuple{
-			TypeName: x.TypeName, FieldNames: x.Fields, Values: l.Items,
-		}}}, nil
+		n = &pb.MontyNode{Kind: &pb.MontyNode_Bytes{Bytes: x}}
+	case Decimal:
+		n = &pb.MontyNode{Kind: &pb.MontyNode_Decimal{Decimal: string(x)}}
 	case time.Time:
-		return encodeTime(x), nil
+		n = timeNode(x, false)
 	case *time.Time:
 		if x == nil {
-			return c.encode(nil)
+			return leaf(nil)
 		}
-		return encodeTime(*x), nil
+		n = timeNode(*x, false)
 	case time.Duration:
-		return encodeDuration(x), nil
+		n = durationNode(x)
 	case TimeDelta:
-		return &pb.MontyObject{Kind: &pb.MontyObject_Timedelta{Timedelta: &pb.TimeDelta{
+		n = &pb.MontyNode{Kind: &pb.MontyNode_Timedelta{Timedelta: &pb.TimeDelta{
 			Days: int32(x.Days), Seconds: int32(x.Seconds), Microseconds: int32(x.Microseconds),
-		}}}, nil
+		}}}
 	case Date:
-		return &pb.MontyObject{Kind: &pb.MontyObject_Date{Date: &pb.Date{
+		n = &pb.MontyNode{Kind: &pb.MontyNode_Date{Date: &pb.Date{
 			Year: int32(x.Year), Month: uint32(x.Month), Day: uint32(x.Day),
-		}}}, nil
+		}}}
 	case Time:
 		t := &pb.Time{
 			Hour: uint32(x.Hour), Minute: uint32(x.Minute), Second: uint32(x.Second),
@@ -418,112 +437,187 @@ func (c *codec) encode(v any) (*pb.MontyObject, error) {
 				t.TimezoneName = &name
 			}
 		}
-		return &pb.MontyObject{Kind: &pb.MontyObject_Time{Time: t}}, nil
+		n = &pb.MontyNode{Kind: &pb.MontyNode_Time{Time: t}}
 	case *time.Location:
 		if x == nil {
-			return c.encode(nil)
+			return leaf(nil)
 		}
-		name, offset := time.Now().In(x).Zone()
-		tz := &pb.TimeZone{OffsetSeconds: int32(offset)}
-		if name != "" {
-			tz.Name = &name
-		}
-		return &pb.MontyObject{Kind: &pb.MontyObject_Timezone{Timezone: tz}}, nil
+		n = &pb.MontyNode{Kind: &pb.MontyNode_Timezone{Timezone: timezoneProto(x)}}
 	case *Exception:
 		if x == nil {
-			return c.encode(nil)
+			return leaf(nil)
 		}
-		return encodeException(x), nil
+		n = exceptionNode(x)
 	case Exception:
-		return encodeException(&x), nil
+		n = exceptionNode(&x)
 	case ellipsis:
-		return &pb.MontyObject{Kind: &pb.MontyObject_Ellipsis{Ellipsis: unit()}}, nil
+		n = &pb.MontyNode{Kind: &pb.MontyNode_Ellipsis{Ellipsis: unit()}}
 	case notImplemented:
-		return &pb.MontyObject{Kind: &pb.MontyObject_NotImplemented{NotImplemented: unit()}}, nil
+		n = &pb.MontyNode{Kind: &pb.MontyNode_NotImplemented{NotImplemented: unit()}}
 	case Path:
-		return &pb.MontyObject{Kind: &pb.MontyObject_Path{Path: string(x)}}, nil
+		n = &pb.MontyNode{Kind: &pb.MontyNode_Path{Path: string(x)}}
 	case FileHandle:
-		return &pb.MontyObject{Kind: &pb.MontyObject_FileHandle{FileHandle: &pb.FileHandle{
+		n = &pb.MontyNode{Kind: &pb.MontyNode_FileHandle{FileHandle: &pb.FileHandle{
 			Path: x.Path, Mode: x.Mode, Position: x.Position,
-		}}}, nil
+		}}}
 	case FunctionRef:
 		if x.Builtin {
-			return &pb.MontyObject{Kind: &pb.MontyObject_BuiltinFunction{BuiltinFunction: x.Name}}, nil
+			n = &pb.MontyNode{Kind: &pb.MontyNode_BuiltinFunction{BuiltinFunction: x.Name}}
+			break
 		}
 		fn := &pb.Function{Name: x.Name}
 		if x.Doc != "" {
 			doc := x.Doc
 			fn.Docstring = &doc
 		}
-		return &pb.MontyObject{Kind: &pb.MontyObject_Function{Function: fn}}, nil
+		n = &pb.MontyNode{Kind: &pb.MontyNode_Function{Function: fn}}
 	case TypeRef:
 		if x.Origin != TypeOriginBuiltin && x.Origin != 0 {
-			return nil, fmt.Errorf("monty: only builtin types can be passed into the sandbox, not %q", x.Name)
+			return nil, true, fmt.Errorf("monty: only builtin types can be passed into the sandbox, not %q", x.Name)
 		}
-		return &pb.MontyObject{Kind: &pb.MontyObject_Type{Type: &pb.Type{
+		n = &pb.MontyNode{Kind: &pb.MontyNode_Type{Type: &pb.Type{
 			Name: x.Name, Origin: pb.TypeOrigin_TYPE_ORIGIN_BUILTIN,
-		}}}, nil
+		}}}
 	case Repr:
-		return nil, fmt.Errorf("monty: a Repr value cannot be passed into the sandbox")
+		return nil, true, fmt.Errorf("monty: a Repr value cannot be passed into the sandbox")
 	case *ClassInstance:
-		return nil, fmt.Errorf("monty: sandbox class instances cannot be passed back into the sandbox")
-	case *HostObject:
-		return c.encodeObject(x)
-	case *HostClass:
-		if x == nil {
-			return c.encode(nil)
-		}
-		t, err := c.encodeClass(x, true)
-		if err != nil {
-			return nil, err
-		}
-		return &pb.MontyObject{Kind: &pb.MontyObject_Type{Type: t}}, nil
-	case error:
-		return encodeException(&Exception{Type: "RuntimeError", Message: x.Error()}), nil
+		return nil, true, fmt.Errorf("monty: sandbox class instances cannot be passed back into the sandbox")
+	default:
+		return nil, false, nil
 	}
-	return c.encodeReflect(reflect.ValueOf(v))
+	return n, true, nil
 }
 
-func (c *codec) encodeReflect(rv reflect.Value) (*pb.MontyObject, error) {
+// node appends v's nodes, children first, and returns v's index.
+func (a *arena) node(v any) (uint32, error) {
+	if n, ok, err := leaf(v); ok {
+		if err != nil {
+			return 0, err
+		}
+		return a.push(n), nil
+	}
+	switch x := v.(type) {
+	case []any:
+		l, err := a.indexes(x)
+		if err != nil {
+			return 0, err
+		}
+		return a.push(&pb.MontyNode{Kind: &pb.MontyNode_List{List: l}}), nil
+	case Tuple:
+		l, err := a.indexes(x)
+		if err != nil {
+			return 0, err
+		}
+		return a.push(&pb.MontyNode{Kind: &pb.MontyNode_Tuple{Tuple: l}}), nil
+	case Set:
+		l, err := a.indexes(x)
+		if err != nil {
+			return 0, err
+		}
+		return a.push(&pb.MontyNode{Kind: &pb.MontyNode_Set{Set: l}}), nil
+	case FrozenSet:
+		l, err := a.indexes(x)
+		if err != nil {
+			return 0, err
+		}
+		return a.push(&pb.MontyNode{Kind: &pb.MontyNode_FrozenSet{FrozenSet: l}}), nil
+	case map[string]any:
+		d, err := a.stringMap(x)
+		if err != nil {
+			return 0, err
+		}
+		return a.push(&pb.MontyNode{Kind: &pb.MontyNode_Dict{Dict: d}}), nil
+	case Dict:
+		pairs := make([]*pb.NodePair, 0, len(x))
+		for i, item := range x {
+			k, err := a.node(item.Key)
+			if err != nil {
+				return 0, fmt.Errorf("dict key %d: %w", i, err)
+			}
+			val, err := a.node(item.Value)
+			if err != nil {
+				return 0, fmt.Errorf("dict value %d: %w", i, err)
+			}
+			pairs = append(pairs, &pb.NodePair{Key: k, Value: val})
+		}
+		return a.push(&pb.MontyNode{Kind: &pb.MontyNode_Dict{Dict: &pb.NodePairs{Pairs: pairs}}}), nil
+	case NamedTuple:
+		l, err := a.indexes(x.Values)
+		if err != nil {
+			return 0, err
+		}
+		return a.push(&pb.MontyNode{Kind: &pb.MontyNode_NamedTuple{NamedTuple: &pb.NamedTupleNode{
+			TypeName: x.TypeName, FieldNames: x.Fields, Values: l.Items,
+		}}}), nil
+	case *HostObject:
+		return a.object(x)
+	case *HostClass:
+		if x == nil {
+			return a.node(nil)
+		}
+		return a.class(x)
+	case *Module:
+		if x == nil {
+			return a.node(nil)
+		}
+		attrs, err := a.stringMap(x.Attrs)
+		if err != nil {
+			return 0, fmt.Errorf("module %s: %w", x.Name, err)
+		}
+		if x.id == "" {
+			x.id = newUUID()
+		}
+		return a.push(&pb.MontyNode{Kind: &pb.MontyNode_Module{Module: &pb.ModuleNode{
+			Name: x.Name, Id: &pb.Uuid{Data: uuidBytes(x.id)}, Attrs: attrs,
+		}}}), nil
+	case error:
+		return a.push(exceptionNode(&Exception{Type: "RuntimeError", Message: x.Error()})), nil
+	}
+	return a.reflect(reflect.ValueOf(v))
+}
+
+func (a *arena) reflect(rv reflect.Value) (uint32, error) {
 	switch rv.Kind() {
 	case reflect.Pointer, reflect.Interface:
 		if rv.IsNil() {
-			return c.encode(nil)
+			return a.node(nil)
 		}
-		return c.encode(rv.Elem().Interface())
+		return a.node(rv.Elem().Interface())
 	case reflect.Bool:
-		return c.encode(rv.Bool())
+		return a.node(rv.Bool())
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return c.encode(rv.Int())
+		return a.node(rv.Int())
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-		return c.encode(rv.Uint())
+		return a.node(rv.Uint())
 	case reflect.Float32, reflect.Float64:
-		return c.encode(rv.Float())
+		return a.node(rv.Float())
+	case reflect.Complex64, reflect.Complex128:
+		return a.node(rv.Complex())
 	case reflect.String:
-		return c.encode(rv.String())
+		return a.node(rv.String())
 	case reflect.Slice, reflect.Array:
 		if rv.Kind() == reflect.Slice && rv.Type().Elem().Kind() == reflect.Uint8 {
-			return c.encode(rv.Bytes())
+			return a.node(rv.Bytes())
 		}
 		items := make([]any, rv.Len())
 		for i := range items {
 			items[i] = rv.Index(i).Interface()
 		}
-		return c.encode(items)
+		return a.node(items)
 	case reflect.Struct:
-		return c.encode(structToMap(rv))
+		return a.node(structToMap(rv))
 	case reflect.Map:
 		if rv.Type().Key().Kind() != reflect.String {
-			return nil, fmt.Errorf("monty: cannot convert map with %s keys; use monty.Dict", rv.Type().Key())
+			return 0, fmt.Errorf("monty: cannot convert map with %s keys; use monty.Dict", rv.Type().Key())
 		}
 		m := make(map[string]any, rv.Len())
 		iter := rv.MapRange()
 		for iter.Next() {
 			m[iter.Key().String()] = iter.Value().Interface()
 		}
-		return c.encode(m)
+		return a.node(m)
 	}
-	return nil, fmt.Errorf("monty: cannot convert Go value of type %s", rv.Type())
+	return 0, fmt.Errorf("monty: cannot convert Go value of type %s", rv.Type())
 }
 
 // structToMap flattens an exported-field struct into a map, honouring json
@@ -576,116 +670,139 @@ func fieldName(f reflect.StructField) (name string, omitEmpty bool) {
 	return name, omitEmpty
 }
 
-// encodeClass builds the wire type for a host class, sending its Attrs the
-// first time the session sees the class (or whenever withAttrs asks).
-func (c *codec) encodeClass(cl *HostClass, withAttrs bool) (*pb.Type, error) {
-	if c.store == nil {
-		return nil, fmt.Errorf("monty: host objects can only be passed through a session")
+// class appends the type node of a host class, once per arena, sending its
+// Attrs the first time the session sees the class.
+func (a *arena) class(cl *HostClass) (uint32, error) {
+	if a.c.store == nil {
+		return 0, fmt.Errorf("monty: host objects can only be passed through a session")
 	}
-	c.store.registerClass(cl)
+	if idx, ok := a.classes[cl]; ok {
+		return idx, nil
+	}
+	a.c.store.registerClass(cl)
 	t := &pb.Type{
 		Name:        cl.Name,
 		Id:          &pb.Uuid{Data: uuidBytes(cl.ID())},
 		Origin:      pb.TypeOrigin_TYPE_ORIGIN_HOST,
 		IsDataclass: cl.IsDataclass,
 	}
-	if withAttrs && len(cl.Attrs) > 0 && !c.store.sentClasses[cl.ID()] {
-		attrs, err := c.encodeStringMap(cl.Attrs)
+	if len(cl.Attrs) > 0 && !a.c.store.sentClasses[cl.ID()] {
+		attrs, err := a.stringMap(cl.Attrs)
 		if err != nil {
-			return nil, fmt.Errorf("class %s attrs: %w", cl.Name, err)
+			return 0, fmt.Errorf("class %s attrs: %w", cl.Name, err)
 		}
 		t.Attrs = attrs
-		c.store.sentClasses[cl.ID()] = true
+		a.c.store.sentClasses[cl.ID()] = true
+		a.sent = append(a.sent, cl)
 	}
-	return t, nil
+	idx := a.push(&pb.MontyNode{Kind: &pb.MontyNode_Type{Type: t}})
+	if a.classes == nil {
+		a.classes = map[*HostClass]uint32{}
+	}
+	a.classes[cl] = idx
+	return idx, nil
 }
 
-// encodeObject builds the wire instance for a host object.
-func (c *codec) encodeObject(o *HostObject) (*pb.MontyObject, error) {
+// object appends the instance node of a host object.
+func (a *arena) object(o *HostObject) (uint32, error) {
 	if o == nil {
-		return c.encode(nil)
+		return a.node(nil)
 	}
 	if o.Class == nil {
-		return nil, fmt.Errorf("monty: host object has no class")
+		return 0, fmt.Errorf("monty: host object has no class")
 	}
-	if c.store == nil {
-		return nil, fmt.Errorf("monty: host objects can only be passed through a session")
-	}
-	t, err := c.encodeClass(o.Class, true)
+	class, err := a.class(o.Class)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
-	c.store.registerObject(o)
-	attrs, err := c.encodeStringMap(o.Attrs)
+	a.c.store.registerObject(o)
+	attrs, err := a.stringMap(o.Attrs)
 	if err != nil {
-		return nil, fmt.Errorf("object attrs: %w", err)
+		return 0, fmt.Errorf("object attrs: %w", err)
 	}
-	return &pb.MontyObject{Kind: &pb.MontyObject_ClassInstance{ClassInstance: &pb.ClassInstance{
-		Type:       t,
+	return a.push(&pb.MontyNode{Kind: &pb.MontyNode_ClassInstance{ClassInstance: &pb.ClassInstanceNode{
+		ClassType:  class,
 		InstanceId: &pb.Uuid{Data: uuidBytes(o.ID())},
 		Attrs:      attrs,
-	}}}, nil
+	}}}), nil
 }
 
 // ---------------------------------------------------------------------------
 // protobuf → Go
 // ---------------------------------------------------------------------------
 
-func (c *codec) decodeList(l *pb.ObjectList) ([]any, error) {
-	if l == nil {
-		return []any{}, nil
+// values is a decoded arena.
+type values struct {
+	c     *codec
+	nodes []*pb.MontyNode
+	vals  []any
+}
+
+// decode converts every node of a in one forward pass: nodes are in
+// post-order, so a container's children are decoded before it.
+func (c *codec) decode(a *pb.Arena) (*values, error) {
+	v := &values{c: c, nodes: a.GetNodes(), vals: make([]any, 0, len(a.GetNodes()))}
+	for i, n := range v.nodes {
+		val, err := v.build(n)
+		if err != nil {
+			return nil, fmt.Errorf("monty: value node %d: %w", i, err)
+		}
+		v.vals = append(v.vals, val)
 	}
-	out := make([]any, 0, len(l.Items))
-	for _, item := range l.Items {
-		v, err := c.decode(item)
+	return v, nil
+}
+
+// at returns the value at idx. While decoding, only earlier nodes exist.
+func (v *values) at(idx uint32) (any, error) {
+	if int(idx) >= len(v.vals) {
+		return nil, fmt.Errorf("value index %d out of range", idx)
+	}
+	return v.vals[idx], nil
+}
+
+func (v *values) list(idxs []uint32) ([]any, error) {
+	out := make([]any, len(idxs))
+	for i, idx := range idxs {
+		val, err := v.at(idx)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, v)
+		out[i] = val
 	}
 	return out, nil
 }
 
-func (c *codec) decodeDict(d *pb.Dict) (any, error) {
-	if d == nil {
-		return map[string]any{}, nil
-	}
-	items := make(Dict, 0, len(d.Pairs))
-	allStrings := true
-	for _, p := range d.Pairs {
-		k, err := c.decode(p.Key)
+func (v *values) pairs(pairs []*pb.NodePair) (Dict, error) {
+	items := make(Dict, 0, len(pairs))
+	for _, p := range pairs {
+		k, err := v.at(p.GetKey())
 		if err != nil {
 			return nil, err
 		}
-		v, err := c.decode(p.Value)
+		val, err := v.at(p.GetValue())
 		if err != nil {
 			return nil, err
 		}
-		if _, ok := k.(string); !ok {
-			allStrings = false
-		}
-		items = append(items, DictItem{Key: k, Value: v})
+		items = append(items, DictItem{Key: k, Value: val})
 	}
-	if !allStrings {
-		return items, nil
-	}
-	m := make(map[string]any, len(items))
-	for _, item := range items {
-		m[item.Key.(string)] = item.Value
-	}
-	return m, nil
+	return items, nil
 }
 
-// decodeStringDict decodes a dict whose keys must all be strings.
-func (c *codec) decodeStringDict(d *pb.Dict) (map[string]any, error) {
-	v, err := c.decodeDict(d)
+// stringDict decodes pairs whose keys must all be strings.
+func (v *values) stringDict(pairs []*pb.NodePair) (map[string]any, error) {
+	items, err := v.pairs(pairs)
 	if err != nil {
 		return nil, err
 	}
-	if m, ok := v.(map[string]any); ok {
-		return m, nil
+	m := make(map[string]any, len(items))
+	for _, item := range items {
+		k, ok := item.Key.(string)
+		if !ok {
+			return nil, fmt.Errorf("non-string key %v", item.Key)
+		}
+		m[k] = item.Value
 	}
-	return nil, fmt.Errorf("monty: dict has non-string keys")
+	return m, nil
 }
 
 func uuidString(u *pb.Uuid) string {
@@ -696,11 +813,11 @@ func uuidString(u *pb.Uuid) string {
 	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
 }
 
-func (c *codec) decodeType(t *pb.Type) (TypeRef, error) {
+func (v *values) typeRef(t *pb.Type) (TypeRef, error) {
 	if t == nil {
-		return TypeRef{}, fmt.Errorf("monty: empty type")
+		return TypeRef{}, fmt.Errorf("empty type")
 	}
-	attrs, err := c.decodeStringDict(t.Attrs)
+	attrs, err := v.stringDict(t.GetAttrs().GetPairs())
 	if err != nil {
 		return TypeRef{}, err
 	}
@@ -713,70 +830,75 @@ func (c *codec) decodeType(t *pb.Type) (TypeRef, error) {
 	}, nil
 }
 
-// decode converts a wire value into its Go representation.
-func (c *codec) decode(obj *pb.MontyObject) (any, error) {
-	if obj == nil {
+// build converts one node whose children are already decoded.
+func (v *values) build(n *pb.MontyNode) (any, error) {
+	store := v.c.store
+	switch k := n.GetKind().(type) {
+	case nil, *pb.MontyNode_None:
 		return nil, nil
-	}
-	switch k := obj.Kind.(type) {
-	case nil, *pb.MontyObject_None:
-		return nil, nil
-	case *pb.MontyObject_Ellipsis:
+	case *pb.MontyNode_Ellipsis:
 		return Ellipsis, nil
-	case *pb.MontyObject_NotImplemented:
+	case *pb.MontyNode_NotImplemented:
 		return NotImplemented, nil
-	case *pb.MontyObject_Boolean:
+	case *pb.MontyNode_Boolean:
 		return k.Boolean, nil
-	case *pb.MontyObject_Int:
+	case *pb.MontyNode_Int:
 		return k.Int, nil
-	case *pb.MontyObject_Bigint:
+	case *pb.MontyNode_Bigint:
 		b := new(big.Int).SetBytes(k.Bigint.GetMagnitude())
 		if k.Bigint.GetNegative() {
 			b.Neg(b)
 		}
 		return b, nil
-	case *pb.MontyObject_Float:
+	case *pb.MontyNode_Float:
 		return k.Float, nil
-	case *pb.MontyObject_Str:
+	case *pb.MontyNode_Complex:
+		return complex(k.Complex.GetReal(), k.Complex.GetImag()), nil
+	case *pb.MontyNode_Decimal:
+		return Decimal(k.Decimal), nil
+	case *pb.MontyNode_Str:
 		return k.Str, nil
-	case *pb.MontyObject_Bytes:
+	case *pb.MontyNode_Bytes:
 		return k.Bytes, nil
-	case *pb.MontyObject_List:
-		return c.decodeList(k.List)
-	case *pb.MontyObject_Tuple:
-		items, err := c.decodeList(k.Tuple)
-		if err != nil {
-			return nil, err
-		}
-		return Tuple(items), nil
-	case *pb.MontyObject_Set:
-		items, err := c.decodeList(k.Set)
-		if err != nil {
-			return nil, err
-		}
-		return Set(items), nil
-	case *pb.MontyObject_FrozenSet:
-		items, err := c.decodeList(k.FrozenSet)
-		if err != nil {
-			return nil, err
-		}
-		return FrozenSet(items), nil
-	case *pb.MontyObject_NamedTuple:
-		values, err := c.decodeList(&pb.ObjectList{Items: k.NamedTuple.GetValues()})
+	case *pb.MontyNode_List:
+		return v.list(k.List.GetItems())
+	case *pb.MontyNode_Tuple:
+		items, err := v.list(k.Tuple.GetItems())
+		return Tuple(items), err
+	case *pb.MontyNode_Set:
+		items, err := v.list(k.Set.GetItems())
+		return Set(items), err
+	case *pb.MontyNode_FrozenSet:
+		items, err := v.list(k.FrozenSet.GetItems())
+		return FrozenSet(items), err
+	case *pb.MontyNode_NamedTuple:
+		vals, err := v.list(k.NamedTuple.GetValues())
 		if err != nil {
 			return nil, err
 		}
 		return NamedTuple{
 			TypeName: k.NamedTuple.GetTypeName(),
 			Fields:   k.NamedTuple.GetFieldNames(),
-			Values:   values,
+			Values:   vals,
 		}, nil
-	case *pb.MontyObject_Dict:
-		return c.decodeDict(k.Dict)
-	case *pb.MontyObject_Date:
+	case *pb.MontyNode_Dict:
+		items, err := v.pairs(k.Dict.GetPairs())
+		if err != nil {
+			return nil, err
+		}
+		m := make(map[string]any, len(items))
+		for _, item := range items {
+			key, ok := item.Key.(string)
+			if !ok {
+				return items, nil
+			}
+			m[key] = item.Value
+		}
+		return m, nil
+	case *pb.MontyNode_Date:
 		d := k.Date
 		return Date{Year: int(d.GetYear()), Month: time.Month(d.GetMonth()), Day: int(d.GetDay())}, nil
-	case *pb.MontyObject_Time:
+	case *pb.MontyNode_Time:
 		t := k.Time
 		out := Time{
 			Hour: int(t.GetHour()), Minute: int(t.GetMinute()), Second: int(t.GetSecond()),
@@ -787,7 +909,7 @@ func (c *codec) decode(obj *pb.MontyObject) (any, error) {
 			out.Offset = &off
 		}
 		return out, nil
-	case *pb.MontyObject_Datetime:
+	case *pb.MontyNode_Datetime:
 		dt := k.Datetime
 		loc := time.UTC
 		if dt.OffsetSeconds != nil {
@@ -796,7 +918,7 @@ func (c *codec) decode(obj *pb.MontyObject) (any, error) {
 		return time.Date(int(dt.GetYear()), time.Month(dt.GetMonth()), int(dt.GetDay()),
 			int(dt.GetHour()), int(dt.GetMinute()), int(dt.GetSecond()),
 			int(dt.GetMicrosecond())*1000, loc), nil
-	case *pb.MontyObject_Timedelta:
+	case *pb.MontyNode_Timedelta:
 		td := k.Timedelta
 		days, secs, micros := int64(td.GetDays()), int64(td.GetSeconds()), int64(td.GetMicroseconds())
 		totalMicros := days*86400*1_000_000 + secs*1_000_000 + micros
@@ -806,50 +928,60 @@ func (c *codec) decode(obj *pb.MontyObject) (any, error) {
 			return TimeDelta{Days: int(days), Seconds: int(secs), Microseconds: int(micros)}, nil
 		}
 		return time.Duration(totalMicros) * time.Microsecond, nil
-	case *pb.MontyObject_Timezone:
+	case *pb.MontyNode_Timezone:
 		return time.FixedZone(k.Timezone.GetName(), int(k.Timezone.GetOffsetSeconds())), nil
-	case *pb.MontyObject_Exception:
+	case *pb.MontyNode_Exception:
 		return &Exception{Type: k.Exception.GetExcType(), Message: k.Exception.GetArg()}, nil
-	case *pb.MontyObject_Type:
-		if c.store != nil && k.Type.GetOrigin() == pb.TypeOrigin_TYPE_ORIGIN_HOST {
-			if cl, ok := c.store.classes[uuidString(k.Type.GetId())]; ok {
+	case *pb.MontyNode_Type:
+		if store != nil && k.Type.GetOrigin() == pb.TypeOrigin_TYPE_ORIGIN_HOST {
+			if cl, ok := store.classes[uuidString(k.Type.GetId())]; ok {
 				return cl, nil
 			}
 		}
-		return c.decodeType(k.Type)
-	case *pb.MontyObject_ClassInstance:
+		return v.typeRef(k.Type)
+	case *pb.MontyNode_ClassInstance:
 		ci := k.ClassInstance
-		if c.store != nil && ci.GetType().GetOrigin() == pb.TypeOrigin_TYPE_ORIGIN_HOST {
-			if o, ok := c.store.objects[uuidString(ci.GetInstanceId())]; ok {
+		if int(ci.GetClassType()) >= len(v.vals) {
+			return nil, fmt.Errorf("class index %d out of range", ci.GetClassType())
+		}
+		class := v.nodes[ci.GetClassType()].GetType()
+		if store != nil && class.GetOrigin() == pb.TypeOrigin_TYPE_ORIGIN_HOST {
+			if o, ok := store.objects[uuidString(ci.GetInstanceId())]; ok {
 				return o, nil
 			}
 		}
-		t, err := c.decodeType(ci.GetType())
+		t, err := v.typeRef(class)
 		if err != nil {
 			return nil, err
 		}
-		attrs, err := c.decodeStringDict(ci.GetAttrs())
+		attrs, err := v.stringDict(ci.GetAttrs().GetPairs())
 		if err != nil {
 			return nil, err
 		}
 		return &ClassInstance{Type: t, ID: uuidString(ci.GetInstanceId()), Attrs: attrs}, nil
-	case *pb.MontyObject_Function:
+	case *pb.MontyNode_Module:
+		attrs, err := v.stringDict(k.Module.GetAttrs().GetPairs())
+		if err != nil {
+			return nil, err
+		}
+		return &Module{Name: k.Module.GetName(), Attrs: attrs, id: uuidString(k.Module.GetId())}, nil
+	case *pb.MontyNode_Function:
 		return FunctionRef{Name: k.Function.GetName(), Doc: k.Function.GetDocstring()}, nil
-	case *pb.MontyObject_BuiltinFunction:
+	case *pb.MontyNode_BuiltinFunction:
 		return FunctionRef{Name: k.BuiltinFunction, Builtin: true}, nil
-	case *pb.MontyObject_Path:
+	case *pb.MontyNode_Path:
 		return Path(k.Path), nil
-	case *pb.MontyObject_FileHandle:
+	case *pb.MontyNode_FileHandle:
 		fh := k.FileHandle
 		return FileHandle{Path: fh.GetPath(), Mode: fh.GetMode(), Position: fh.GetPosition()}, nil
-	case *pb.MontyObject_Repr:
+	case *pb.MontyNode_Repr:
 		return Repr(k.Repr), nil
-	case *pb.MontyObject_Cycle:
-		return Repr(k.Cycle.GetPlaceholder()), nil
-	case *pb.MontyObject_Uuid:
-		return nil, fmt.Errorf("monty: uuid values are not supported")
+	case *pb.MontyNode_Cycle:
+		return Repr(k.Cycle), nil
+	case *pb.MontyNode_Uuid:
+		return nil, fmt.Errorf("uuid values are not supported")
 	}
-	return nil, fmt.Errorf("monty: unknown value kind %T", obj.Kind)
+	return nil, fmt.Errorf("unknown value kind %T", n.GetKind())
 }
 
 // exceptionFromProto converts a raised exception, rendering its traceback.

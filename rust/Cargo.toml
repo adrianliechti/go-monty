@@ -1,9 +1,9 @@
 [package]
 name = "monty-go-wasm"
-version = "0.0.23"
+version = "1.6.0"
 edition = "2024"
 publish = false
-description = "Core WebAssembly module driving a Monty protocol child one framed request per call (for go-monty)."
+description = "Core WebAssembly module driving a Monty protocol worker one framed request per call (for go-monty)."
 license = "MIT"
 
 [lib]
@@ -12,9 +12,9 @@ crate-type = ["cdylib"]
 [dependencies]
 # Pinned to the upstream monty commit this binding tracks (the checked-in
 # internal/pb/monty.proto is copied from the same commit).
-monty-proto = { git = "https://github.com/pydantic/monty", rev = "302e0f27ec8516689ba90793cd0381149e5f4076", features = ["worker"] }
-monty-alloc = { git = "https://github.com/pydantic/monty", rev = "302e0f27ec8516689ba90793cd0381149e5f4076" }
-monty-types = { git = "https://github.com/pydantic/monty", rev = "302e0f27ec8516689ba90793cd0381149e5f4076" }
+monty-proto = { git = "https://github.com/pydantic/monty", rev = "3f89dcbf82071896efb5e3ded507db4191e8d829", features = ["worker"] }
+monty-alloc = { git = "https://github.com/pydantic/monty", rev = "3f89dcbf82071896efb5e3ded507db4191e8d829" }
+monty-types = { git = "https://github.com/pydantic/monty", rev = "3f89dcbf82071896efb5e3ded507db4191e8d829" }
 
 [profile.release]
 lto = "fat"

@@ -85,7 +85,10 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "monty: -memory:", err)
 		return 2
 	}
-	sessionOpts := monty.SessionOptions{ScriptName: name, Limits: limits, TypeCheck: *typeCheck, TypeCheckFormat: monty.TypeCheckConcise}
+	sessionOpts := monty.SessionOptions{
+		ScriptName: name, Limits: limits, TypeCheck: *typeCheck, TypeCheckFormat: monty.TypeCheckConcise,
+		OSPolicy: monty.OSPolicy{TimeZone: time.Local},
+	}
 	if *stubsFile != "" {
 		stubs, err := os.ReadFile(*stubsFile)
 		if err != nil {
@@ -224,7 +227,7 @@ func buildHandlers(mounts, envs []string, inheritEnv bool) ([]monty.OSHandler, [
 		}
 		vars[k] = v
 	}
-	handlers = append(handlers, monty.Env(vars), monty.Clock(time.Now))
+	handlers = append(handlers, monty.Env(vars))
 	return handlers, closers, nil
 }
 

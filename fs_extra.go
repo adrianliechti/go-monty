@@ -197,6 +197,19 @@ func (o *Overlay) WriteFile(name string, data []byte, perm fs.FileMode) error {
 	return o.upper.WriteFile(name, data, perm)
 }
 
+func (o *Overlay) Create(name string, perm fs.FileMode) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if _, err := o.stat(name); err == nil {
+		return &fs.PathError{Op: "create", Path: name, Err: fs.ErrExist}
+	}
+	if err := o.ensureUpperDir(path.Dir(name)); err != nil {
+		return err
+	}
+	delete(o.whiteout, name)
+	return o.upper.WriteFile(name, nil, perm)
+}
+
 func (o *Overlay) AppendFile(name string, data []byte, perm fs.FileMode) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()

@@ -57,7 +57,8 @@ func main() {
 	defer hostDir.Close()
 
 	session, err := rt.NewSession(ctx, monty.SessionOptions{
-		Limits: &monty.Limits{MaxDuration: time.Second, MaxMemory: 64 << 20},
+		Limits:   &monty.Limits{MaxDuration: time.Second, MaxMemory: 64 << 20},
+		OSPolicy: monty.OSPolicy{TimeZone: time.Local},
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -68,7 +69,6 @@ func main() {
 		OS: monty.Handlers(
 			monty.NewFS("/data", hostDir),
 			monty.NewFS("/tmp", monty.NewMemFS(nil)),
-			monty.Clock(time.Now),
 		),
 	})
 	if err != nil {

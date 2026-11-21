@@ -128,7 +128,7 @@ func TestReadOnlyFSAndErrors(t *testing.T) {
 }
 
 func TestHandlersEnvClock(t *testing.T) {
-	s := newSession(t, monty.SessionOptions{})
+	s := newSession(t, monty.SessionOptions{OSPolicy: monty.OSPolicy{Clock: monty.ClockHost}})
 	fixed := time.Date(2030, 5, 6, 7, 8, 9, 0, time.UTC)
 	os := monty.Handlers(
 		monty.NewFS("/data", monty.NewMemFS(map[string]any{"f": "1"})),

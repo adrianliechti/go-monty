@@ -15,7 +15,7 @@ import (
 
 // protocolVersion is the monty-proto wire version this package speaks. The
 // embedded module must serve it.
-const protocolVersion = 2
+const protocolVersion = 8
 
 // Runtime holds the compiled sandbox module. It is safe for concurrent use;
 // create one per process and derive Sessions from it.
@@ -45,7 +45,7 @@ func WithModule(module []byte) RuntimeOption {
 }
 
 // WithCacheDir caches the compiled module on disk so later NewRuntime calls in
-// other processes skip compilation (which takes a few seconds for the 19 MB
+// other processes skip compilation (which takes a few seconds for the 24 MB
 // module). The directory is created if missing.
 func WithCacheDir(dir string) RuntimeOption {
 	return func(c *runtimeConfig) { c.cacheDir = dir }

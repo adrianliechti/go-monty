@@ -92,11 +92,11 @@ func (p *Pool) filler(ctx context.Context) {
 // the first request otherwise pays for (~2 ms). Reset is valid before a
 // session exists and leaves the worker in the no-session state.
 func warm(ctx context.Context, w *worker) bool {
-	events, err := w.send(ctx, &pb.ParentRequest{Kind: &pb.ParentRequest_Reset_{Reset_: &pb.Reset{}}}, nil)
+	events, err := w.send(ctx, &pb.ClientRequest{Kind: &pb.ClientRequest_Reset_{Reset_: &pb.Reset{}}}, nil)
 	if err != nil {
 		return false
 	}
-	_, ok := events[len(events)-1].Kind.(*pb.ChildEvent_Ok)
+	_, ok := events[len(events)-1].Kind.(*pb.WorkerEvent_Ok)
 	return ok
 }
 
@@ -138,10 +138,10 @@ func (p *Pool) release(ctx context.Context, w *worker) {
 		(p.opts.MaxRuns == 0 || w.runs < p.opts.MaxRuns) &&
 		w.memorySize() <= p.opts.MaxMemory
 	if healthy {
-		events, err := w.send(ctx, &pb.ParentRequest{Kind: &pb.ParentRequest_Reset_{Reset_: &pb.Reset{}}}, nil)
+		events, err := w.send(ctx, &pb.ClientRequest{Kind: &pb.ClientRequest_Reset_{Reset_: &pb.Reset{}}}, nil)
 		if err != nil {
 			healthy = false
-		} else if _, ok := events[len(events)-1].Kind.(*pb.ChildEvent_Ok); !ok {
+		} else if _, ok := events[len(events)-1].Kind.(*pb.WorkerEvent_Ok); !ok {
 			healthy = false
 		}
 	}

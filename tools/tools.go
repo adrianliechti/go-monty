@@ -27,6 +27,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	monty "github.com/adrianliechti/go-monty"
 )
@@ -47,6 +48,9 @@ type Tool struct {
 	errOut bool
 	// valueOut reports whether the function returns a value.
 	valueOut bool
+	// schema is set for a tool registered with AddSchema instead of a typed
+	// Go function.
+	schema *schemaTool
 }
 
 // Registry is an ordered set of tools sharing one stub namespace.
@@ -55,6 +59,8 @@ type Registry struct {
 	order []string
 	dicts map[reflect.Type]string
 	names map[string]bool
+	// schemaDicts are the TypedDicts AddSchema derived from object schemas.
+	schemaDicts []schemaDict
 }
 
 // New creates an empty Registry.
@@ -156,6 +162,11 @@ var (
 
 // Function adapts the tool to monty.Function.
 func (t *Tool) Function() monty.Function {
+	if t.schema != nil {
+		return func(ctx context.Context, call *monty.Call) (any, error) {
+			return t.schema.call(ctx, t.Name, call)
+		}
+	}
 	return func(ctx context.Context, call *monty.Call) (any, error) {
 		args, err := t.bind(call)
 		if err != nil {
@@ -564,6 +575,9 @@ func (r *Registry) Signature(t *Tool) string {
 	if t.Async {
 		b.WriteString("async ")
 	}
+	if t.schema != nil {
+		return b.String() + "def " + t.Name + t.schema.signature()
+	}
 	fmt.Fprintf(&b, "def %s(", t.Name)
 	optionalFrom := len(t.Params)
 	for i := len(t.Params) - 1; i >= 0 && t.paramType(i).Kind() == reflect.Pointer; i-- {
@@ -588,42 +602,92 @@ func (r *Registry) Signature(t *Tool) string {
 }
 
 func (r *Registry) header() string {
-	return "import datetime\nimport pathlib\nfrom typing import Any, TypedDict\n\n"
+	return "import datetime\nimport pathlib\nfrom typing import Any, Literal, NotRequired, TypedDict\n\n"
 }
 
-func (r *Registry) typedDicts() string {
-	types := make([]reflect.Type, 0, len(r.dicts))
-	for t := range r.dicts {
-		types = append(types, t)
-	}
-	sort.Slice(types, func(i, j int) bool { return r.dicts[types[i]] < r.dicts[types[j]] })
-	var b strings.Builder
-	for _, t := range types {
-		fmt.Fprintf(&b, "class %s(TypedDict):\n", r.dicts[t])
-		n := 0
+// classes returns every TypedDict declaration by name.
+func (r *Registry) classes() map[string]string {
+	out := map[string]string{}
+	for t, name := range r.dicts {
+		var b strings.Builder
 		for i := 0; i < t.NumField(); i++ {
 			f := t.Field(i)
 			if !f.IsExported() || jsonName(f) == "" {
 				continue
 			}
 			fmt.Fprintf(&b, "    %s: %s\n", jsonName(f), r.pyType(f.Type))
-			n++
 		}
-		if n == 0 {
-			b.WriteString("    pass\n")
+		out[name] = b.String()
+	}
+	for _, d := range r.schemaDicts {
+		out[d.name] = d.body
+	}
+	for name, body := range out {
+		if body == "" {
+			body = "    pass\n"
 		}
-		b.WriteString("\n")
+		out[name] = fmt.Sprintf("class %s(TypedDict):\n%s\n", name, body)
+	}
+	return out
+}
+
+// typedDicts renders the TypedDicts the given declarations mention, and
+// the ones those mention, sorted by name.
+func (r *Registry) typedDicts(mentions ...string) string {
+	classes := r.classes()
+	used := map[string]bool{}
+	for len(mentions) > 0 {
+		text := mentions[0]
+		mentions = mentions[1:]
+		for _, word := range strings.FieldsFunc(text, func(c rune) bool {
+			return c != '_' && !unicode.IsLetter(c) && !unicode.IsDigit(c)
+		}) {
+			if decl, ok := classes[word]; ok && !used[word] {
+				used[word] = true
+				mentions = append(mentions, decl)
+			}
+		}
+	}
+	names := make([]string, 0, len(used))
+	for name := range used {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var b strings.Builder
+	for _, name := range names {
+		b.WriteString(classes[name])
 	}
 	return b.String()
 }
 
+func (r *Registry) signatures(names []string) []string {
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		if t := r.tools[name]; t != nil {
+			out = append(out, r.Signature(t))
+		}
+	}
+	return out
+}
+
 // Stubs renders the .pyi text for monty.SessionOptions.TypeCheckStubs.
 func (r *Registry) Stubs() string {
+	return r.header() + r.Signatures()
+}
+
+// Signatures renders the declarations of the named tools, and the
+// TypedDicts they use, without docstrings; without names, of every tool.
+// Unknown names are skipped. Use it to show a model the exact call shape of
+// a tool it got wrong.
+func (r *Registry) Signatures(names ...string) string {
+	if len(names) == 0 {
+		names = r.order
+	}
 	var b strings.Builder
-	b.WriteString(r.header())
-	b.WriteString(r.typedDicts())
-	for _, name := range r.order {
-		fmt.Fprintf(&b, "%s: ...\n", r.Signature(r.tools[name]))
+	signatures := r.signatures(names)
+	b.WriteString(r.typedDicts(signatures...))
+	for _, signature := range signatures {
+		fmt.Fprintf(&b, "%s: ...\n", signature)
 	}
 	return b.String()
 }
@@ -631,14 +695,30 @@ func (r *Registry) Stubs() string {
 // Prompt renders the same declarations with docstrings, for a model's
 // system prompt.
 func (r *Registry) Prompt() string {
+	return "The following Python functions are available; they run outside the sandbox.\n\n" + r.Describe()
+}
+
+// Describe renders the declarations of the named tools with docstrings,
+// and the TypedDicts they use; without names, of every tool. Unknown names
+// are skipped. Use it to show a model only the tools it asked about.
+func (r *Registry) Describe(names ...string) string {
+	if len(names) == 0 {
+		names = r.order
+	}
 	var b strings.Builder
-	b.WriteString("The following Python functions are available; they run outside the sandbox.\n\n")
-	b.WriteString(r.typedDicts())
-	for _, name := range r.order {
+	b.WriteString(r.typedDicts(r.signatures(names)...))
+	for _, name := range names {
 		t := r.tools[name]
+		if t == nil {
+			continue
+		}
+		doc := t.Description
+		if t.schema != nil {
+			doc = t.schema.docstring(doc)
+		}
 		fmt.Fprintf(&b, "%s:\n", r.Signature(t))
-		if t.Description != "" {
-			fmt.Fprintf(&b, "    \"\"\"%s\"\"\"\n", t.Description)
+		if doc != "" {
+			fmt.Fprintf(&b, "    \"\"\"%s\"\"\"\n", strings.ReplaceAll(doc, `"""`, `'''`))
 		} else {
 			b.WriteString("    ...\n")
 		}

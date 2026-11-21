@@ -6,7 +6,7 @@ package wasm
 
 import _ "embed"
 
-// Module is the core wasm module driving one Monty protocol child.
+// Module is the core wasm module driving one Monty protocol worker.
 //
 //go:embed monty.wasm
 var Module []byte

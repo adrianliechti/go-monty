@@ -20,14 +20,15 @@
 //!
 //! Imports:
 //!
-//! * `monty.event(ptr, len)`          one framed `ChildEvent` (4-byte LE
+//! * `monty.event(ptr, len)`          one framed `WorkerEvent` (4-byte LE
 //!                                    length prefix + protobuf)
 #![allow(unsafe_code)]
 
-use std::cell::RefCell;
+use std::{cell::RefCell, collections::hash_map::RandomState, time::Instant};
 
-use monty_proto::worker::{Child, EventSink, HandleOutcome, fatal_error_event, protocol_violation};
+use monty_proto::worker::{EventSink, HandleOutcome, SessionBudget, Worker, fatal_error_event, protocol_violation};
 use monty_proto::{FrameError, FrameReader, PROTOCOL_VERSION, pb, write_frame};
+use monty_types::memory_limit_with_headroom;
 
 /// Counts allocations against the session's `max_memory` limit. Crossing the
 /// hard ceiling aborts, which in wasm is a trap the host observes as an error
@@ -43,7 +44,21 @@ unsafe extern "C" {
 
 thread_local! {
     /// The session worker, retained for the lifetime of this instance.
-    static CHILD: RefCell<Child> = RefCell::new(Child::default());
+    static WORKER: RefCell<Worker> = RefCell::new(new_worker());
+}
+
+/// Builds the worker after the first clock read and `random_get`, so the
+/// buffers WASI allocates for them join the memory baseline instead of the
+/// first session's budget.
+fn new_worker() -> Worker {
+    let _ = Instant::now();
+    let _ = RandomState::new();
+    Worker::default()
+}
+
+/// Arms the allocator with the session's memory budget plus upstream's headroom.
+fn apply_budget(budget: SessionBudget) -> Result<(), &'static str> {
+    monty_alloc::set_hard_limit(memory_limit_with_headroom(budget.max_memory, budget.type_check))
 }
 
 const OUTCOME_CONTINUE: u32 = 0;
@@ -56,7 +71,7 @@ struct HostSink {
 }
 
 impl EventSink for HostSink {
-    fn send(&mut self, event: &pb::ChildEvent) -> Result<(), FrameError> {
+    fn send(&mut self, event: &pb::WorkerEvent) -> Result<(), FrameError> {
         self.buf.clear();
         // `write_frame` rejects oversize frames before writing anything.
         write_frame(&mut self.buf, event)?;
@@ -64,6 +79,11 @@ impl EventSink for HostSink {
         // call and keeps its own copy.
         unsafe { self::event(self.buf.as_ptr(), self.buf.len() as u32) };
         Ok(())
+    }
+
+    // A `Configure` carrying its first request runs it in the same turn.
+    fn session_opened(&mut self, budget: SessionBudget) {
+        let _ = apply_budget(budget);
     }
 }
 
@@ -94,11 +114,9 @@ pub extern "C" fn monty_dispatch(ptr: *mut u8, len: u32) -> u32 {
     let request = unsafe { Vec::from_raw_parts(ptr, len as usize, len as usize) };
     let mut sink = HostSink { buf: Vec::new() };
 
-    let (outcome, limit) = CHILD.with_borrow_mut(|child| {
-        let outcome = dispatch(child, &request, &mut sink);
-        let budget = child.session_budget();
-        let limit = monty_alloc::set_limit(budget.max_memory, budget.type_check);
-        (outcome, limit)
+    let (outcome, limit) = WORKER.with_borrow_mut(|worker| {
+        let outcome = dispatch(worker, &request, &mut sink);
+        (outcome, apply_budget(worker.session_budget()))
     });
     drop(request);
 
@@ -116,16 +134,16 @@ pub extern "C" fn monty_dispatch(ptr: *mut u8, len: u32) -> u32 {
 
 /// Decodes and handles one request frame; mirrors `monty-proto`'s buffered
 /// `dispatch_frame` but with a streaming sink.
-fn dispatch(child: &mut Child, request_frame: &[u8], sink: &mut HostSink) -> HandleOutcome {
+fn dispatch(worker: &mut Worker, request_frame: &[u8], sink: &mut HostSink) -> HandleOutcome {
     let mut reader = FrameReader::new(request_frame);
-    match reader.read::<pb::ParentRequest>() {
-        Ok(Some(request)) => match child.handle(request, sink) {
+    match reader.read::<pb::ClientRequest>() {
+        Ok(Some(request)) => match worker.handle(request, sink) {
             Ok(outcome) => outcome,
             // an oversize suspension (or any unrecoverable error) leaves no
             // resume point, so emit a fatal last gasp and stop the worker
             Err(FrameError::FrameTooLarge { len, max }) => {
                 let _ =
-                    sink.send(&child.fatal_event(&format!("response frame of {len} bytes exceeds maximum of {max} bytes")));
+                    sink.send(&worker.fatal_event(&format!("response frame of {len} bytes exceeds maximum of {max} bytes")));
                 HandleOutcome::Shutdown
             }
             Err(_) => HandleOutcome::Shutdown,
@@ -136,7 +154,7 @@ fn dispatch(child: &mut Child, request_frame: &[u8], sink: &mut HostSink) -> Han
             HandleOutcome::Continue
         }
         Err(err) => {
-            let _ = sink.send(&child.fatal_event(&format!("malformed request frame: {err}")));
+            let _ = sink.send(&worker.fatal_event(&format!("malformed request frame: {err}")));
             HandleOutcome::Shutdown
         }
     }

@@ -34,7 +34,7 @@ type collectorKey struct{}
 // eventCollector receives the framed events of one turn as they happen.
 type eventCollector struct {
 	onPrint func(*pb.Print)
-	events  []*pb.ChildEvent
+	events  []*pb.WorkerEvent
 	err     error
 }
 
@@ -56,12 +56,12 @@ func instantiateHostModule(ctx context.Context, rt wazero.Runtime) error {
 				c.err = &WorkerError{Message: "malformed event frame"}
 				return
 			}
-			ev := &pb.ChildEvent{}
+			ev := &pb.WorkerEvent{}
 			if err := proto.Unmarshal(frame[4:], ev); err != nil {
 				c.err = &WorkerError{Message: "undecodable event frame", Err: err}
 				return
 			}
-			if p, ok := ev.Kind.(*pb.ChildEvent_Print); ok {
+			if p, ok := ev.Kind.(*pb.WorkerEvent_Print); ok {
 				if c.onPrint != nil {
 					c.onPrint(p.Print)
 				}
@@ -74,7 +74,7 @@ func instantiateHostModule(ctx context.Context, rt wazero.Runtime) error {
 	return err
 }
 
-// worker is one instantiated wasm module holding one Monty protocol child.
+// worker is one instantiated wasm module holding one Monty protocol worker.
 // Not safe for concurrent use; Session serialises access.
 type worker struct {
 	mod      api.Module
@@ -137,7 +137,7 @@ func (w *worker) close(ctx context.Context) error {
 // send runs one protocol turn. Print events go to onPrint as they happen;
 // the turn's remaining events are returned. A returned error other than an
 // encoding error means the worker is dead.
-func (w *worker) send(ctx context.Context, req *pb.ParentRequest, onPrint func(*pb.Print)) ([]*pb.ChildEvent, error) {
+func (w *worker) send(ctx context.Context, req *pb.ClientRequest, onPrint func(*pb.Print)) ([]*pb.WorkerEvent, error) {
 	if w.dead {
 		return nil, ErrClosed
 	}

@@ -297,7 +297,7 @@ func TestTypeCheck(t *testing.T) {
 }
 
 func TestOSHandler(t *testing.T) {
-	s := newSession(t, monty.SessionOptions{})
+	s := newSession(t, monty.SessionOptions{OSPolicy: monty.OSPolicy{Clock: monty.ClockHost}})
 	files := map[string]string{"/data/in.txt": "hello"}
 	handler := monty.OSFunc(func(ctx context.Context, call *monty.OSCall) (any, error) {
 		switch call.Name {

@@ -1,6 +1,6 @@
 # Upstream Monty commit the wasm module and the protobuf schema are built from.
 # Keep in sync with rust/Cargo.toml.
-MONTY_REV := 302e0f27ec8516689ba90793cd0381149e5f4076
+MONTY_REV := 3f89dcbf82071896efb5e3ded507db4191e8d829
 MONTY_URL := https://raw.githubusercontent.com/pydantic/monty/$(MONTY_REV)
 
 GO_PACKAGE := github.com/adrianliechti/go-monty

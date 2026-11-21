@@ -38,6 +38,12 @@ type (
 	RenameFS interface {
 		Rename(oldname, newname string) error
 	}
+	// CreateFS creates a new empty file, failing with fs.ErrExist when
+	// anything exists at name. It backs open(path, 'x'), which is refused
+	// without it rather than risk truncating a file.
+	CreateFS interface {
+		Create(name string, perm fs.FileMode) error
+	}
 )
 
 // FS serves the sandbox's pathlib and open() calls under Mount from an fs.FS.
@@ -95,6 +101,14 @@ func (d *DirRoot) AppendFile(name string, data []byte, perm fs.FileMode) error {
 		werr = cerr
 	}
 	return werr
+}
+
+func (d *DirRoot) Create(name string, perm fs.FileMode) error {
+	f, err := d.root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
+	if err != nil {
+		return err
+	}
+	return f.Close()
 }
 
 // Close releases the host directory.
@@ -161,6 +175,14 @@ func (m *MemFS) WriteFile(name string, data []byte, perm fs.FileMode) error {
 	}
 	m.m[name] = &fstest.MapFile{Data: append([]byte(nil), data...), Mode: perm, ModTime: time.Now()}
 	return nil
+}
+
+func (m *MemFS) Create(name string, perm fs.FileMode) error {
+	m.init()
+	if _, ok := m.m[name]; ok {
+		return &fs.PathError{Op: "create", Path: name, Err: fs.ErrExist}
+	}
+	return m.WriteFile(name, nil, perm)
 }
 
 func (m *MemFS) AppendFile(name string, data []byte, perm fs.FileMode) error {
@@ -274,7 +296,8 @@ func (f *FS) virtual(name string) string {
 // HandleOSCall implements OSHandler.
 func (f *FS) HandleOSCall(ctx context.Context, call *OSCall) (any, error) {
 	switch call.Name {
-	case "getenv", "get_environ", "date_today", "datetime_now":
+	case "getenv", "get_environ", "date_today", "datetime_now", "time", "sleep", "async_sleep",
+		"urandom", "import", "import_stubs", "get_type_hints":
 		return nil, ErrNotHandled
 	}
 	name, ok := f.relative(call.Path)
@@ -342,6 +365,17 @@ func (f *FS) handle(call *OSCall, name string) (any, error) {
 		return len(call.Bytes), f.writeFile(name, call.Bytes, true)
 	case "open":
 		return f.open(call, name)
+	case "create_exclusive":
+		c, ok := f.FS.(CreateFS)
+		if !ok {
+			return nil, fs.ErrPermission
+		}
+		if err := c.Create(name, 0o644); err != nil {
+			return nil, err
+		}
+		return FileHandle{Path: f.virtual(name), Mode: call.Mode}, nil
+	case "scan":
+		return f.scan(call, name)
 	case "mkdir":
 		return nil, f.mkdir(call, name)
 	case "unlink", "rmdir":
@@ -372,6 +406,50 @@ func (f *FS) handle(call *OSCall, name string) (any, error) {
 		return nil, r.Rename(name, dest)
 	}
 	return nil, ErrNotHandled
+}
+
+// scan lists the subtree at name for os.walk, os.scandir and Path.glob. The
+// glob pattern is a pruning hint the sandbox does not rely on, so every
+// entry within the requested depth is returned.
+func (f *FS) scan(call *OSCall, name string) ([]ScanEntry, error) {
+	info, err := fs.Stat(f.FS, name)
+	if err != nil {
+		return nil, err
+	}
+	args := call.Scan
+	if args == nil {
+		args = &ScanArgs{}
+	}
+	entries := []ScanEntry{{IsDir: info.IsDir(), IsFile: info.Mode().IsRegular()}}
+	var walk func(dir, rel string, depth int) error
+	walk = func(dir, rel string, depth int) error {
+		if args.MaxDepth != nil && depth > *args.MaxDepth {
+			return nil
+		}
+		list, err := fs.ReadDir(f.FS, dir)
+		if err != nil {
+			return err
+		}
+		for _, e := range list {
+			entry := ScanEntry{Path: path.Join(rel, e.Name()), IsSymlink: e.Type()&fs.ModeSymlink != 0}
+			// Like os.DirEntry, is_dir and is_file follow a symlink.
+			if target, err := fs.Stat(f.FS, path.Join(dir, e.Name())); err == nil {
+				entry.IsDir, entry.IsFile = target.IsDir(), target.Mode().IsRegular()
+			}
+			entries = append(entries, entry)
+			if entry.IsDir && (!entry.IsSymlink || args.FollowSymlinks || args.RecurseSymlinks) {
+				// An unreadable directory is listed but not descended into.
+				_ = walk(path.Join(dir, e.Name()), entry.Path, depth+1)
+			}
+		}
+		return nil
+	}
+	if info.IsDir() {
+		if err := walk(name, "", 1); err != nil {
+			return nil, err
+		}
+	}
+	return entries, nil
 }
 
 func (f *FS) readFile(name string) ([]byte, error) {
@@ -538,12 +616,12 @@ func Env(vars map[string]string) OSHandler {
 	})
 }
 
-// Clock answers datetime.now() and date.today() from now; pass time.Now for
-// the real clock.
+// Clock answers datetime.now(), date.today() and time.time() from now, for
+// a session whose OSPolicy.Clock is ClockHost.
 func Clock(now func() time.Time) OSHandler {
 	return OSFunc(func(ctx context.Context, call *OSCall) (any, error) {
 		switch call.Name {
-		case "date_today", "datetime_now":
+		case "date_today", "datetime_now", "time":
 			return now(), nil
 		}
 		return nil, ErrNotHandled
